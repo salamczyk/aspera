@@ -1,0 +1,64 @@
+name: Native engine
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      graphics_smoke:
+        description: Run native graphics lifecycle checks on runners with a usable graphics device
+        type: boolean
+        default: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux window-system development packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev mesa-vulkan-drivers xvfb
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --parallel 3
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Headless game smoke test
+        shell: bash
+        run: |
+          SERVER=build/aspera_server
+          if [ -f build/Release/aspera_server.exe ]; then SERVER=build/Release/aspera_server.exe; fi
+          "$SERVER" --project games/demolition --ticks 60 --no-network
+          "$SERVER" --project games/construction --ticks 60 --no-network
+          "$SERVER" --project games/lighting-bounce --ticks 270 --no-network
+      - name: Package version-3 lighting game and all shaders
+        shell: bash
+        run: |
+          COOKER=build/aspera_cooker
+          if [ -f build/Release/aspera_cooker.exe ]; then COOKER=build/Release/aspera_cooker.exe; fi
+          "$COOKER" --package games/lighting-bounce out/lighting-game
+      - name: Native graphics lifecycle and lighting captures
+        if: github.event_name == 'workflow_dispatch' && inputs.graphics_smoke
+        shell: bash
+        run: |
+          PLAYER=build/aspera_player
+          EDITOR=build/aspera_editor
+          if [ -f build/Release/aspera_player.exe ]; then PLAYER=build/Release/aspera_player.exe; EDITOR=build/Release/aspera_editor.exe; fi
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a "$EDITOR" --project games/lighting-lab --render-smoke --screenshot out/lifecycle.ppm
+            xvfb-run -a python3 tools/check_lighting.py --player "$PLAYER"
+          else
+            "$EDITOR" --project games/lighting-lab --render-smoke --screenshot out/lifecycle.ppm
+            python3 tools/check_lighting.py --player "$PLAYER"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lighting-${{ matrix.os }}
+          path: |
+            build/shaders
+            out/lighting-checks
+            out/lifecycle.ppm

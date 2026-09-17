@@ -1,0 +1,7 @@
+/build*/
+/.deps/
+/out/
+*.sav
+*.tmp
+*.png
+.DS_Store

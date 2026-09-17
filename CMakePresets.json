@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {"name":"dev","generator":"Ninja","binaryDir":"${sourceDir}/build","cacheVariables":{"CMAKE_BUILD_TYPE":"RelWithDebInfo"}},
+    {"name":"server","inherits":"dev","binaryDir":"${sourceDir}/build-server","cacheVariables":{"ASPERA_DESKTOP":"OFF"}},
+    {"name":"core","inherits":"dev","binaryDir":"${sourceDir}/build-core","cacheVariables":{"ASPERA_CORE_ONLY":"ON"}}
+  ],
+  "buildPresets":[{"name":"dev","configurePreset":"dev"},{"name":"server","configurePreset":"server"},{"name":"core","configurePreset":"core"}],
+  "testPresets":[{"name":"dev","configurePreset":"dev","output":{"outputOnFailure":true}},{"name":"server","configurePreset":"server","output":{"outputOnFailure":true}},{"name":"core","configurePreset":"core","output":{"outputOnFailure":true}}]
+}
