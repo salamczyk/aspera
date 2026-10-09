@@ -14,7 +14,64 @@ Validated on the available macOS ARM64 host. Windows and Linux CI definitions ar
 
 The offline benchmark with two million structural voxels, 5,400 structural nodes, and 500 additional single-voxel dynamic bodies reported CPU tick p50 **0.827 ms**, p95 **1.580 ms**, and p99 **1.622 ms** over 120 ticks. This short steady-state run does not measure sustained destructive editing, rendering, startup worst-case latency, or the requested 10,000-node workload. It does not establish the target hardware performance gates.
 
-See [implementation status](STATUS.md) for the remaining release requirements. In particular, the current structural load solver is an approximation, player prediction is unfinished, and render/collision rebuilds remain object-granular.
+See [implementation status](STATUS.md) for the remaining release requirements. In particular, the current structural load solver is an approximation, player prediction uses sampled dynamic collision, and render/collision rebuilds remain object-granular.
+
+## Quarry Demolition and player sessions
+
+The bounded co-op slice is exercised with the following commands from the
+repository root:
+
+```sh
+# Offline scene/script and save smoke
+./build/aspera_server --project games/quarry-demolition --no-network --ticks 120 --save /tmp/quarry.sav
+
+# Listen host plus remote clients
+./build/aspera_player --project games/quarry-demolition --host --port 24680
+./build/aspera_player --project games/quarry-demolition --connect 127.0.0.1 --port 24680
+
+# Dedicated authority
+./build/aspera_server --project games/quarry-demolition --port 24680
+
+# Packaged build
+./build/aspera_cooker --package games/quarry-demolition out/quarry-demolition
+./out/quarry-demolition/Play.sh
+```
+
+Acceptance checks cover four assigned player IDs, safe recovery at each authored
+spawn, grounded movement through the apron and post-collapse rubble, authoritative
+four-metre damage/build rays, late join during a collapse, disconnect cleanup, and
+host-only round reset. The objective is checked from material counts: only IDs 2
+and 3 contribute to the 68% works denominator, ID 4 supplies core integrity, and
+the build material (ID 5) is excluded. Player state is transient, protocol 4 is
+required, and save/cooked-asset formats remain version 3.
+
+Local validation on 2026-10-08:
+
+- The native desktop targets build, all nine CTest suites pass, and the core-only
+  build passes both tests.
+- Controller tests exercise walking, diagonal speed, jumping, ceilings, slopes,
+  steps, moving supports, light debris, edited collision geometry, tool reach,
+  one-shot actions, publication-time construction clearance, blocked recovery,
+  and bounded prediction history.
+- The quarry test verifies four clear grounded spawns, an initially connected
+  structure, physical rubble after staged support removal, core survival,
+  construction-independent scoring, and shared victory state.
+- Networking checks cover listen/dedicated ownership, manual/bounds recovery,
+  project reload, late player poses, and world snapshot resets under impairment.
+  Stationary prediction converges within 0.1 m after one second at 100 ms RTT,
+  jitter/reordering, and 2% loss.
+- A 600-second four-player loopback soak completed 23,760 simulation frames and
+  39 project/round resets with bounded prediction history and a complete roster.
+  The final transport ordering changes were subsequently checked by the focused
+  network regressions. This is a stability soak, not a 60 FPS performance result.
+- Finite Metal player and editor lifecycle smoke tests passed; captures were
+  inspected. The quarry server completed 120 offline ticks and saved its world;
+  the native cooker produced a macOS package.
+
+Reproduce the soak with `./build/network_tests --player-soak-seconds 600`.
+Logs, captures, and the local package are retained in `out/player-validation/`.
+Dynamic debris prediction remains approximate; target-hardware qualification and
+native Windows/Linux runtime evidence remain separate release requirements.
 
 ## Collision destruction — 2026-09-11
 
@@ -236,3 +293,74 @@ Raw benchmark output and the editor capture are retained under
 The global graph load solve, rotating-fragment cell traversal, whole-object edit
 copies, and save/network encoding remain in place. These results meet the chosen
 finite-map CPU latency targets; they do not qualify a general 60 FPS release gate.
+
+
+## Optional native path tracing — October 8–9, 2026
+
+Implementation and local validation used the 8-core Apple M3. The default
+renderer remains bgfx raster; path tracing is opt-in with `--renderer path-traced`.
+Both native Metal and Vulkan C++ backends compile in the local build. All native
+Metal shader pipelines compile through the device's runtime compiler; Vulkan
+modules compile for Vulkan 1.2 and pass SPIR-V validation. Offline Metal compilation
+was unavailable because this host has Command Line Tools rather than full Xcode;
+packaged Metal sources provide the tested runtime-compilation fallback.
+
+Local correctness evidence:
+
+- All ten CTest cases pass. The existing loopback network case required execution
+  outside the sandbox to bind its local test port.
+- Metal API validation passes native renderer smoke/capture runs and the 96-frame
+  path-traced editor lifecycle, including lighting/material undo/redo, topology
+  edits, quality/size changes, teleports, minimize/restore, and scene replacement.
+- The original raster bounce checks and raster editor lifecycle continue to pass.
+- A native stress-overlay smoke with 4,096 regions (more than 65,535 ImGui
+  vertices) passes Metal API validation using segmented vertex offsets and the
+  same stress-color palette as raster rendering. Reference-camera movement from
+  held keys is disabled while exact-sample captures are running.
+- The new capture checker verifies equivalent 256-sample images at 1 versus
+  16 samples per frame: mean channel difference `0.0000417` on the 0–255 scale,
+  with maximum channel difference 1 from rounding.
+- A 257-sample capture at 64 samples per frame exercises the partial final batch.
+  Every pixel inside the closed, unlit room is black (maximum channel 0).
+- The off-camera red card reflects in the smooth metal sample. Its central
+  reflection region has mean RGB `(47.36, 2.80, 2.25)`; the card is behind the
+  camera at `(-1.4, 1.2, -3)`.
+- One- versus six-bounce captures in the diffuse bounce fixture differ by mean
+  channel value `8.5122`, demonstrating additional light transport. Reference
+  captures intentionally retain Monte Carlo noise; ordinary gameplay denoises.
+- A denoised Quarry Demolition gameplay preview is retained with the other
+  captures. The final shaders also handle equal inner/outer spot-light cones.
+
+The sustained October 8 measurements use native **1920×1080**, one sample per
+pixel per frame, six surface interactions, temporal denoising, five 3×3 spatial
+passes, and bloom. Each scene ran once for 60 measured seconds after 5 seconds
+of warm-up, with gameplay/destruction active:
+
+| Scene | Frame p95 | Trace p95 | Denoise/post p95 | Native memory peak |
+| --- | ---: | ---: | ---: | ---: |
+| Demolition | 46.31 ms | 19.74 ms | 22.71 ms | 633.1 MiB |
+| Construction | 37.03 ms | 14.55 ms | 21.21 ms | 633.0 MiB |
+| Collision | 43.06 ms | 16.61 ms | 23.04 ms | 633.0 MiB |
+| Large lighting benchmark | 89.19 ms | 61.21 ms | 22.05 ms | 635.6 MiB |
+
+**The M3 does not meet the 33.3 ms / 30 FPS qualification target.** These are
+single sustained development runs, not three-run qualification. Resolution,
+ray count, bounce limit, and effects were retained rather than reduced to pass
+that target. Spatial filtering was optimized from a 5×5 to 3×3 kernel while
+retaining all five passes. Native Metal frame timing uses the command interval
+envelope because individual pass intervals can overlap on tile GPUs.
+
+Retina benchmark windows are sized in logical points before creation to produce
+the requested physical pixel dimensions. Earlier clamped-window development
+measurements were rejected by the resolution gate and are retained separately.
+
+Raw captures, logs, frame/pass CSVs, hardware/source fingerprints, and reports are
+in `out/path-tracing-validation/`; sustained data is in its `sustained-m3/`
+subdirectory. Reproduce correctness with `tools/check_path_tracing.py`, and
+performance with `tools/run_render_benchmarks.py --renderer path-traced`.
+
+Native Windows/Linux Vulkan execution, Vulkan validation-layer runs on suitable
+hardware, RTX 3060 12 GB performance measurements, and full three-run hardware
+qualification remain external requirements. CI now installs Vulkan development
+packages for Windows/Linux builds; defining those jobs is not evidence that
+remote CI or native Vulkan runtime validation has passed.

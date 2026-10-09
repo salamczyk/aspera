@@ -26,13 +26,19 @@ int main(int argc, char **argv) {
             if (arg == "--project")
                 project = value();
             else if (arg == "--port") {
-                int n = std::stoi(value());
-                if (n < 1 || n > 65535)
+                auto text = value();
+                size_t consumed = 0;
+                int n = std::stoi(text, &consumed);
+                if (consumed != text.size() || n < 1 || n > 65535)
                     throw std::runtime_error("Invalid port");
                 port = uint16_t(n);
-            } else if (arg == "--ticks")
-                ticks = std::stoi(value());
-            else if (arg == "--save")
+            } else if (arg == "--ticks") {
+                auto text = value();
+                size_t consumed = 0;
+                ticks = std::stoi(text, &consumed);
+                if (consumed != text.size() || ticks < 0)
+                    throw std::runtime_error("--ticks must be a non-negative count");
+            } else if (arg == "--save")
                 save = value();
             else if (arg == "--load")
                 load = value();

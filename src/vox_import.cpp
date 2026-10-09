@@ -259,9 +259,12 @@ std::array<uint32_t, 256> defaultPalette() {
 } // namespace
 
 ImportedScene importVox(const std::filesystem::path &path, float voxelSize) {
+    return importVox(readAll(path), voxelSize);
+}
+
+ImportedScene importVox(const std::vector<uint8_t> &bytes, float voxelSize) {
     if (!(voxelSize > 0.f) || !std::isfinite(voxelSize))
         throw std::invalid_argument("voxel size must be positive");
-    auto bytes = readAll(path);
     Reader file(bytes);
     if (file.id() != "VOX ")
         bad("missing VOX signature");
@@ -438,6 +441,10 @@ ImportedScene importVox(const std::filesystem::path &path, float voxelSize) {
             childIds.insert(c);
     }
     std::set<int> visiting, visited;
+    // Instancing means a node may legitimately be expanded under several
+    // transforms, so this is a total-work budget rather than a per-node visit
+    // flag: it keeps a DAG's fan-out from growing exponentially in depth.
+    size_t expansions = 0;
     std::function<void(int, Transform, const std::string &)> visit =
         [&](int id, Transform parent, const std::string &inherited) {
             auto it = nodes.find(id);
@@ -445,6 +452,8 @@ ImportedScene importVox(const std::filesystem::path &path, float voxelSize) {
                 bad("node references missing child");
             if (visiting.size() >= 256)
                 bad("scene graph too deep");
+            if (++expansions > 4u * MaxObjects)
+                bad("scene graph expands to too many instances");
             if (!visiting.insert(id).second)
                 bad("scene graph cycle");
             visited.insert(id);
@@ -476,6 +485,19 @@ ImportedScene importVox(const std::filesystem::path &path, float voxelSize) {
 void writeAsset(const ImportedScene &scene, const std::filesystem::path &path) {
     if (scene.materials.size() > 65535 || scene.objects.size() > MaxObjects)
         throw std::invalid_argument("asset collection exceeds limits");
+    size_t totalCells = 0, totalChunks = 0;
+    for (const auto &a : scene.objects) {
+        totalCells += a.grid.count();
+        totalChunks += a.grid.chunks().size();
+        const auto &q = a.transform.rotation;
+        const float norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+        if (!std::isfinite(norm) || std::abs(norm - 1) > 0.01f)
+            throw std::invalid_argument("asset rotation must be a unit quaternion");
+    }
+    // readAsset refuses beyond these, and an asset its own reader rejects is
+    // indistinguishable from a corrupt file.
+    if (totalCells > 4000000 || totalChunks > 4096)
+        throw std::invalid_argument("asset exceeds the readable voxel/chunk budget");
     Writer w(path);
     w.bytes("ASPA", 4);
     w.u32(3);
@@ -535,7 +557,10 @@ void writeAsset(const ImportedScene &scene, const std::filesystem::path &path) {
 }
 
 ImportedScene readAsset(const std::filesystem::path &path) {
-    auto b = readAll(path);
+    return readAsset(readAll(path));
+}
+
+ImportedScene readAsset(const std::vector<uint8_t> &b) {
     Reader r(b);
     if (r.id() != "ASPA")
         bad("unknown asset signature");

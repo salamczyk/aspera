@@ -82,6 +82,7 @@ struct Session {
     MaterialId material{1};
     Tool tool{Tool::Add};
     bool playing{};
+    bool recoverRequested{};
     bool showStats{true};
     bool showEvents{true};
     bool stress{};
@@ -258,14 +259,23 @@ void lightingUi(Engine &engine, Network &network, Session &state, Renderer &rend
         return;
     }
     int quality = renderer.quality() == RenderQuality::Low ? 1 : 0;
+    ImGui::BeginDisabled(renderer.pathTraced());
     if (ImGui::Combo("Quality", &quality, "Balanced\0Low\0"))
         renderer.setQuality(quality ? RenderQuality::Low : RenderQuality::Balanced);
+    ImGui::EndDisabled();
     int debug = int(renderer.debug());
     if (ImGui::Combo("View", &debug,
-                     "Final\0Material\0Direct light\0Sun shadows\0Indirect light\0Contact "
-                     "AO\0Voxel visibility\0"))
+                     renderer.pathTraced() ? "Final\0Material\0Normal\0Diffuse\0Specular\0Depth\0History\0" :
+                     "Final\0Material\0Direct light\0Sun shadows\0Indirect light\0Contact AO\0Voxel visibility\0"))
         renderer.setDebug(RenderDebug(debug));
     const auto stats = renderer.timings();
+    ImGui::Text("Renderer: %s (restart to change)", stats.backend.c_str());
+    if (!stats.fallbackReason.empty()) ImGui::TextWrapped("%s", stats.fallbackReason.c_str());
+    if (stats.ptBounces) {
+        ImGui::Text("%u spp | %u bounces | accumulated %u",stats.ptSamples,stats.ptBounces,stats.accumulatedSamples);
+        ImGui::Text("Trace %.2f | denoise %.2f | AS %.2f ms",stats.traceMs,stats.denoiseMs,stats.accelerationMs);
+        ImGui::Text("Path tracing %.1f MiB",stats.ptBytes/1048576.);
+    }
     ImGui::Text("GPU %.2f ms | GI %.2f ms", stats.gpuMs, stats.giMs);
     ImGui::Text("Textures %.1f MiB | GI %.1f MiB", stats.textureBytes / 1048576.,
                 stats.giBytes / 1048576.);
@@ -380,23 +390,40 @@ void lightingUi(Engine &engine, Network &network, Session &state, Renderer &rend
 
 void editorUi(Engine &engine, Network &network, const AppOptions &options, Session &state,
               Renderer &renderer, const Camera &camera) {
-    ImGui::SetNextWindowPos({12, 12}, ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize({ImGui::GetIO().DisplaySize.x - 24, 84}, ImGuiCond_FirstUseEver);
-    ImGui::Begin("ASPERA // COMMAND", nullptr, ImGuiWindowFlags_MenuBar);
+    ImGui::SetNextWindowPos({12, 12}, ImGuiCond_Always);
+    // The command bar follows the current logical window width, including resize/DPI changes.
+    ImGui::SetNextWindowSize({ImGui::GetIO().DisplaySize.x - 24, 84}, ImGuiCond_Always);
+    ImGui::Begin("ASPERA // COMMAND", nullptr,
+                 ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("Scene")) {
-            if (ImGui::MenuItem("Save", "Ctrl+S"))
-                saveWorld(engine.world, options.project / "scene.aspera");
+            if (ImGui::MenuItem("Save", "Ctrl+S")) {
+                try {
+                    saveWorld(engine.world, options.project / "scene.aspera");
+                    engine.emit("scene", 0, "Scene saved");
+                } catch (const std::exception &error) {
+                    engine.emit("scene_error", 0, error.what());
+                }
+            }
             ImGui::BeginDisabled(network.isClient());
             if (ImGui::MenuItem("Load") &&
                 std::filesystem::exists(options.project / "scene.aspera")) {
-                snapshot(engine, state);
-                engine.world = loadWorld(options.project / "scene.aspera");
-                renderer.invalidateMeshes();
-                engine.resetPhysics();
+                try {
+                    snapshot(engine, state);
+                    engine.world = loadWorld(options.project / "scene.aspera");
+                    renderer.invalidateMeshes();
+                    engine.resetPhysics();
+                } catch (const std::exception &error) {
+                    engine.emit("scene_error", 0, error.what());
+                }
             }
-            if (ImGui::MenuItem("Reload Lua"))
-                engine.reloadScripts();
+            if (ImGui::MenuItem("Reload Lua")) {
+                try {
+                    engine.reloadScripts();
+                } catch (const std::exception &error) {
+                    engine.emit("script_error", 0, error.what());
+                }
+            }
             ImGui::EndDisabled();
             ImGui::EndMenu();
         }
@@ -489,6 +516,7 @@ void editorUi(Engine &engine, Network &network, const AppOptions &options, Sessi
                     object.dynamic ? "DYNAMIC" : "STATIC");
         float p[3]{object.transform.position.x, object.transform.position.y,
                    object.transform.position.z};
+        ImGui::BeginDisabled(network.isClient());
         const bool moved = ImGui::DragFloat3("Position", p, 0.05f);
         if (ImGui::IsItemActivated())
             snapshot(engine, state);
@@ -498,6 +526,7 @@ void editorUi(Engine &engine, Network &network, const AppOptions &options, Sessi
             ++engine.world.revision;
             engine.resetPhysics();
         }
+        ImGui::EndDisabled();
         ImGui::Text("Voxels: %zu", object.grid.count());
         static float launchSpeed = 10;
         ImGui::SetNextItemWidth(104);
@@ -589,9 +618,9 @@ void editorUi(Engine &engine, Network &network, const AppOptions &options, Sessi
     }
     ImGui::End();
 
-    ImGui::SetNextWindowPos({ImGui::GetIO().DisplaySize.x - 320, 108}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos({ImGui::GetIO().DisplaySize.x - 12, 108}, ImGuiCond_Always, {1, 0});
     ImGui::SetNextWindowSize({308, 290}, ImGuiCond_FirstUseEver);
-    ImGui::Begin("VOXEL TOOLS");
+    ImGui::Begin("VOXEL TOOLS", nullptr, ImGuiWindowFlags_NoMove);
     const std::array<std::pair<const char *, Tool>, 5> tools{{{"Add", Tool::Add},
                                                               {"Remove", Tool::Remove},
                                                               {"Paint", Tool::Paint},
@@ -645,7 +674,8 @@ void playerValue(const std::string &key, double value) {
         ImGui::Text("%s: %.1f", key.c_str(), value);
 }
 
-bool playerUi(Engine &engine, Network &network, Session &state, const Camera &camera) {
+bool playerUi(Engine &engine, Network &network, Session &state, const Camera &camera,
+              bool characterMode) {
     ImGui::SetNextWindowBgAlpha(.82f);
     ImGui::SetNextWindowPos({16, 16}, ImGuiCond_Always);
     ImGui::Begin("HUD", nullptr,
@@ -662,16 +692,58 @@ bool playerUi(Engine &engine, Network &network, Session &state, const Camera &ca
         ImGui::TextColored({1.f, .30f, .18f, 1.f}, "OBJECTIVE FAILED");
     else
         ImGui::Text("Objective active");
-    ImGui::Text("Structures: %u  |  Peers: %zu", engine.stats.activeBodies, network.peers());
-    ImGui::TextDisabled("WASD move · LMB damage · RMB build · MMB look · TAB camera");
+    if (characterMode)
+        ImGui::Text("Players: %zu / 4", engine.players().size());
+    else
+        ImGui::Text("Structures: %u  |  Peers: %zu", engine.stats.activeBodies, network.peers());
+    ImGui::TextDisabled("Session: %s", network.status().c_str());
+    if (characterMode) {
+        ImGui::TextWrapped("Collapse the marked works while protecting the amber core.");
+        ImGui::TextDisabled(
+            "WASD walk · SPACE jump · LMB damage · RMB build · R recover · ESC cursor");
+        PlayerId localId = network.isClient() ? network.localPlayer() : 1;
+        ImGui::TextDisabled("Player colors: 1 blue · 2 amber · 3 green · 4 brown");
+        if (localId && engine.players().contains(localId) && ImGui::Button("Recover to spawn"))
+            state.recoverRequested = true;
+        for (const auto &[id, player] : engine.players()) {
+            ImGui::Text("Player %u%s%s", id, id == localId ? " (you)" : "",
+                        player.spawnBlocked ? " — spawn blocked" : "");
+        }
+        if (auto hit = raycastWorld(engine.world, camera.eye(), camera.rayDirection(), 4))
+            ImGui::Text("Tool target: %.1f m", length(hit->worldPoint - camera.eye()));
+        else
+            ImGui::TextDisabled("No surface within 4 m");
+        for (auto event = engine.events.rbegin(); event != engine.events.rend(); ++event) {
+            if (engine.world.tick >= event->tick && engine.world.tick - event->tick > 120)
+                break;
+            if (event->type == "tool_rejected" || event->type == "rejected") {
+                ImGui::TextWrapped("%s", event->message.c_str());
+                break;
+            }
+        }
+    } else
+        ImGui::TextDisabled("WASD move · LMB damage · RMB build · MMB look · TAB camera");
     ImGui::Separator();
-    for (const auto &[key, value] : engine.world.properties)
-        if (playerProperty(key))
-            playerValue(key, value);
-    const bool restart = gameState != 0 && ImGui::Button("Restart project");
+    if (characterMode) {
+        const auto &properties = engine.world.properties;
+        if (auto value = properties.find("game.progress"); value != properties.end())
+            ImGui::Text("Works removed: %.0f%% / 68%%", value->second * 100);
+        if (auto value = properties.find("demolition.core_integrity"); value != properties.end())
+            ImGui::Text("Core integrity: %.0f%% (minimum 80%%)", value->second * 100);
+        if (auto value = properties.find("game.time"); value != properties.end())
+            ImGui::Text("Elapsed: %.1f s", value->second);
+    } else
+        for (const auto &[key, value] : engine.world.properties)
+            if (playerProperty(key))
+                playerValue(key, value);
+    const bool restart = gameState != 0 && !network.isClient() && ImGui::Button("Restart project");
     ImGui::End();
     float aimX = 0, aimY = 0;
     SDL_GetMouseState(&aimX, &aimY);
+    if (characterMode) {
+        aimX = ImGui::GetIO().DisplaySize.x * .5f;
+        aimY = ImGui::GetIO().DisplaySize.y * .5f;
+    }
     ImGui::SetNextWindowPos({aimX - 6.f, aimY - 9.f}, ImGuiCond_Always);
     ImGui::Begin("##crosshair", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
@@ -706,6 +778,9 @@ void style() {
 } // namespace
 
 int runApp(const AppOptions &options) {
+    if (options.ptCaptureSamples && (!options.pathTracing || options.screenshot.empty() ||
+        options.host || !options.connectAddress.empty() || !options.renderBenchmark.empty() || options.renderSmoke))
+        throw std::runtime_error("Path-tracing reference capture requires --renderer path-traced, --screenshot, and an offline non-benchmark session");
     if (options.renderSmoke &&
         (options.host || !options.connectAddress.empty() || !options.renderBenchmark.empty()))
         throw std::runtime_error("Render smoke testing requires an offline, non-benchmark session");
@@ -713,13 +788,41 @@ int runApp(const AppOptions &options) {
         SDL_Log("SDL init failed: %s", SDL_GetError());
         return 1;
     }
+    int windowWidth = options.width, windowHeight = options.height;
+    if (!options.renderBenchmark.empty()) {
+        if (auto mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay()); mode && mode->pixel_density > 0) {
+            windowWidth = std::max(1, int(std::lround(options.width / mode->pixel_density)));
+            windowHeight = std::max(1, int(std::lround(options.height / mode->pixel_density)));
+        }
+    }
     SDL_Window *window = SDL_CreateWindow(
-        options.editor ? "Per Aspera — Editor" : "Per Aspera", options.width, options.height,
-        SDL_WINDOW_RESIZABLE | (options.explicitSize ? 0 : SDL_WINDOW_HIGH_PIXEL_DENSITY));
+        options.editor ? "Per Aspera — Editor" : "Per Aspera", windowWidth, windowHeight,
+        SDL_WINDOW_RESIZABLE | ((options.explicitSize && options.renderBenchmark.empty()) ? 0 : SDL_WINDOW_HIGH_PIXEL_DENSITY)
+#if !defined(__APPLE__) && defined(ASPERA_HAS_VULKAN_PT)
+        | (options.pathTracing ? SDL_WINDOW_VULKAN : 0)
+#endif
+        );
+#if !defined(__APPLE__) && defined(ASPERA_HAS_VULKAN_PT)
+    if (!window && options.pathTracing) {
+        SDL_Log("Vulkan window unavailable: %s; trying raster window", SDL_GetError());
+        window = SDL_CreateWindow(options.editor ? "Per Aspera — Editor" : "Per Aspera",
+            options.width, options.height, SDL_WINDOW_RESIZABLE |
+            ((options.explicitSize && options.renderBenchmark.empty()) ? 0 : SDL_WINDOW_HIGH_PIXEL_DENSITY));
+    }
+#endif
     if (!window) {
         SDL_Log("Window failed: %s", SDL_GetError());
         SDL_Quit();
         return 1;
+    }
+    // Benchmark sizes are physical output pixels. Retina logical window dimensions
+    // must fit the display without letting the window manager clamp the target.
+    if (!options.renderBenchmark.empty()) {
+        float density = SDL_GetWindowPixelDensity(window);
+        if (density > 0 && (windowWidth != int(std::lround(options.width / density)) ||
+                             windowHeight != int(std::lround(options.height / density))))
+            SDL_SetWindowSize(window, std::max(1, int(std::lround(options.width / density))),
+                              std::max(1, int(std::lround(options.height / density))));
     }
     int pixelW = options.width, pixelH = options.height;
     SDL_GetWindowSizeInPixels(window, &pixelW, &pixelH);
@@ -728,7 +831,7 @@ int runApp(const AppOptions &options) {
     style();
     ImGui_ImplSDL3_InitForOther(window);
     Renderer renderer;
-    if (!renderer.init(window, static_cast<uint32_t>(pixelW), static_cast<uint32_t>(pixelH))) {
+    if (!renderer.init(window, static_cast<uint32_t>(pixelW), static_cast<uint32_t>(pixelH), options)) {
         SDL_Log("bgfx initialization or shaders failed");
         renderer.shutdown();
         ImGui_ImplSDL3_Shutdown();
@@ -771,6 +874,23 @@ int runApp(const AppOptions &options) {
         camera.topDown = false;
     }
     const bool benchmarking = !options.renderBenchmark.empty();
+    const bool characterMode = engine.playerSettings().enabled && !options.editor &&
+                               !benchmarking && !options.renderSmoke && !options.cameraOverride;
+    if (characterMode && !network.isClient())
+        engine.addPlayer(1);
+    if (characterMode) {
+        camera.topDown = false;
+        const auto &spawn = engine.playerSettings().spawns.front();
+        camera.position = spawn.position + Vec3{0, 1.65f, 0};
+        camera.yaw = spawn.yaw;
+        camera.pitch = spawn.pitch;
+    }
+    PlayerInput pendingPlayerInput;
+    uint64_t playerSequence = 0;
+    uint32_t playerGeneration = 0;
+    bool waitingForSpawn = true;
+    Vec3 visualCorrection{};
+    std::optional<PlayerState> previousPredicted;
     // Build the initial structural/collision caches before the timed warm-up. The tiny fixed
     // first step also initializes the gameplay clock without consuming scripted events.
     if (benchmarking)
@@ -789,7 +909,7 @@ int runApp(const AppOptions &options) {
     size_t landscapeSmokeHistory{};
     auto benchmarkStart = std::chrono::steady_clock::now();
     double benchmarkElapsed = 0;
-    bool running = true, mouseLook = false;
+    bool running = true, mouseLook = characterMode;
     SDL_SetWindowRelativeMouseMode(window, mouseLook);
     auto previous = std::chrono::steady_clock::now();
     float accumulator = 0;
@@ -877,7 +997,7 @@ int runApp(const AppOptions &options) {
         }
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (benchmarking && event.type != SDL_EVENT_QUIT &&
+            if ((benchmarking || options.ptCaptureSamples) && event.type != SDL_EVENT_QUIT &&
                 event.type != SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
                 continue;
             ImGui_ImplSDL3_ProcessEvent(&event);
@@ -890,9 +1010,11 @@ int runApp(const AppOptions &options) {
             }
             if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE) {
                 mouseLook = false;
+                pendingPlayerInput = {};
                 SDL_SetWindowRelativeMouseMode(window, false);
             }
-            if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_TAB && !options.editor) {
+            if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_TAB && !options.editor &&
+                !characterMode) {
                 camera.topDown = !camera.topDown;
                 mouseLook = false;
                 SDL_SetWindowRelativeMouseMode(window, mouseLook);
@@ -913,7 +1035,27 @@ int runApp(const AppOptions &options) {
                 (event.key.mod & SDL_KMOD_CTRL)) {
                 saveWorld(engine.world, options.project / "scene.aspera");
             }
-            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !ImGui::GetIO().WantCaptureMouse) {
+            if (characterMode && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+                mouseLook) {
+                if (event.key.key == SDLK_SPACE)
+                    pendingPlayerInput.jump = true;
+                if (event.key.key == SDLK_R)
+                    pendingPlayerInput.recover = true;
+            }
+            if (characterMode && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                if (mouseLook) {
+                    if (event.button.button == SDL_BUTTON_LEFT)
+                        pendingPlayerInput.damage = true;
+                    if (event.button.button == SDL_BUTTON_RIGHT)
+                        pendingPlayerInput.build = true;
+                } else if (!ImGui::GetIO().WantCaptureMouse &&
+                           event.button.button == SDL_BUTTON_LEFT) {
+                    mouseLook = true;
+                    SDL_SetWindowRelativeMouseMode(window, true);
+                }
+            }
+            if (!characterMode && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                !ImGui::GetIO().WantCaptureMouse) {
                 if (event.button.button ==
                     (options.editor ? SDL_BUTTON_RIGHT : SDL_BUTTON_MIDDLE)) {
                     mouseLook = true;
@@ -945,10 +1087,11 @@ int runApp(const AppOptions &options) {
                                     false);
                 }
             }
-            if ((event.type == SDL_EVENT_MOUSE_BUTTON_UP &&
+            if ((!characterMode && event.type == SDL_EVENT_MOUSE_BUTTON_UP &&
                  event.button.button == (options.editor ? SDL_BUTTON_RIGHT : SDL_BUTTON_MIDDLE)) ||
                 event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
                 mouseLook = false;
+                pendingPlayerInput = {};
                 SDL_SetWindowRelativeMouseMode(window, false);
             }
             if (event.type == SDL_EVENT_MOUSE_MOTION && mouseLook) {
@@ -978,7 +1121,8 @@ int runApp(const AppOptions &options) {
         if (camera.topDown) {
             move.y = 0;
         }
-        camera.position = camera.position + normalized(move) * delta * 5.f;
+        if (!characterMode && !options.ptCaptureSamples)
+            camera.position = camera.position + normalized(move) * delta * 5.f;
         engine.setInput("move_x", move.x);
         engine.setInput("move_z", move.z);
         if (benchmarking) {
@@ -996,7 +1140,50 @@ int runApp(const AppOptions &options) {
         engine.simulating =
             benchmarking ? benchmarkElapsed >= 0 : (!options.editor || state.playing);
         network.poll(engine);
+        if (options.ptCaptureSamples) accumulator = 0;
         while (accumulator >= 1.f / 60.f) {
+            if (characterMode) {
+                const PlayerId localId = network.isClient() ? network.localPlayer() : 1;
+                auto found = engine.players().find(localId);
+                if (found != engine.players().end()) {
+                    if (playerGeneration != found->second.generation) {
+                        playerGeneration = found->second.generation;
+                        playerSequence = 0;
+                        waitingForSpawn = true;
+                        pendingPlayerInput = {};
+                        visualCorrection = {};
+                        previousPredicted.reset();
+                        camera.yaw = found->second.yaw;
+                        camera.pitch = found->second.pitch;
+                    }
+                    if (waitingForSpawn && !found->second.spawnBlocked) {
+                        camera.yaw = found->second.yaw;
+                        camera.pitch = found->second.pitch;
+                        waitingForSpawn = false;
+                    }
+                    PlayerInput input = pendingPlayerInput;
+                    input.sequence = ++playerSequence;
+                    input.generation = playerGeneration;
+                    input.yaw = camera.yaw;
+                    input.pitch = camera.pitch;
+                    if (mouseLook) {
+                        input.moveX = float(keys[SDL_SCANCODE_D]) - float(keys[SDL_SCANCODE_A]);
+                        input.moveZ = float(keys[SDL_SCANCODE_W]) - float(keys[SDL_SCANCODE_S]);
+                        float magnitude =
+                            std::sqrt(input.moveX * input.moveX + input.moveZ * input.moveZ);
+                        if (magnitude > 1) {
+                            input.moveX /= magnitude;
+                            input.moveZ /= magnitude;
+                        }
+                    }
+                    if (network.isClient()) {
+                        network.sendPlayerInput(input);
+                        engine.predictPlayer(localId, input);
+                    } else
+                        engine.submitPlayerInput(localId, input);
+                    pendingPlayerInput = {};
+                }
+            }
             if (!network.isClient()) {
                 engine.step();
                 if (options.host)
@@ -1004,27 +1191,63 @@ int runApp(const AppOptions &options) {
             }
             accumulator -= 1.f / 60.f;
         }
+        if (characterMode) {
+            const PlayerId localId = network.isClient() ? network.localPlayer() : 1;
+            auto pose =
+                network.isClient() ? engine.predictedPlayer() : std::optional<PlayerState>{};
+            if (!pose && engine.players().contains(localId))
+                pose = engine.players().at(localId);
+            if (pose) {
+                if (previousPredicted && pose->generation == previousPredicted->generation) {
+                    Vec3 expected =
+                        previousPredicted->position + previousPredicted->velocity * delta;
+                    Vec3 correction = expected - pose->position;
+                    if (network.isClient() && length(correction) > .02f && length(correction) < .5f)
+                        visualCorrection = visualCorrection + correction;
+                    if (length(correction) >= .5f)
+                        visualCorrection = {};
+                }
+                visualCorrection = visualCorrection * std::max(0.f, 1.f - delta / .1f);
+                if (length(visualCorrection) > .5f)
+                    visualCorrection = {};
+                camera.position = pose->position + Vec3{0, 1.65f, 0} + visualCorrection;
+                previousPredicted = pose;
+            }
+        }
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
+        if (!options.noUi && !renderer.timings().fallbackReason.empty()) {
+            ImGui::SetNextWindowPos({12, ImGui::GetIO().DisplaySize.y - 12}, ImGuiCond_Always, {0,1});
+            ImGui::SetNextWindowSize({420,0}, ImGuiCond_Always);
+            ImGui::Begin("Renderer fallback", nullptr, ImGuiWindowFlags_NoDecoration |
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs);
+            ImGui::TextWrapped("Using raster: %s",renderer.timings().fallbackReason.c_str());
+            ImGui::End();
+        }
         bool restartRequested = false;
         if (options.editor)
             landscapeCompletion(engine, state);
         if (!options.noUi && options.editor)
             editorUi(engine, network, options, state, renderer, camera);
         else if (!options.noUi)
-            restartRequested = playerUi(engine, network, state, camera);
+            restartRequested = playerUi(engine, network, state, camera, characterMode);
         if (!options.noUi && options.editor) {
             lightingUi(engine, network, state, renderer, camera);
             landscapeUi(engine, network, state);
         }
+        if (characterMode && state.recoverRequested) {
+            pendingPlayerInput.recover = true;
+            state.recoverRequested = false;
+        }
         if (!options.noUi && state.showStats) {
-            ImGui::SetNextWindowPos({ImGui::GetIO().DisplaySize.x - 320, 410},
-                                    ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowPos({ImGui::GetIO().DisplaySize.x - 12, 410}, ImGuiCond_Always,
+                                    {1, 0});
             ImGui::SetNextWindowSize({308, 315}, ImGuiCond_FirstUseEver);
-            ImGui::Begin("PERFORMANCE", &state.showStats);
+            ImGui::Begin("PERFORMANCE", &state.showStats, ImGuiWindowFlags_NoMove);
             ImGui::Text("Impacts: %u pending, %u applied", engine.stats.pendingImpacts,
                         engine.stats.processedImpacts);
-            ImGui::Text("Impact overflow: %u", engine.stats.droppedImpacts);
+            ImGui::Text("Impact overflow: %u | clipped steps: %llu", engine.stats.droppedImpacts,
+                        static_cast<unsigned long long>(engine.stats.droppedSimulationSteps));
             ImGui::Text("Pending edits/generation: %u", engine.stats.pendingCommands);
             ImGui::Text("Frame %.2f ms  Physics %.2f ms", engine.stats.frameMs,
                         engine.stats.physicsMs);
@@ -1044,6 +1267,9 @@ int runApp(const AppOptions &options) {
                                static_cast<unsigned long long>(engine.stats.structuralCacheHits),
                                double(engine.stats.structuralCacheBytes) / (1024 * 1024));
             const auto rendering = renderer.timings();
+            ImGui::Text("Renderer: %s", rendering.backend.c_str());
+            if (!rendering.fallbackReason.empty()) ImGui::TextWrapped("%s",rendering.fallbackReason.c_str());
+            if(rendering.ptBounces) ImGui::Text("PT %.2f ms | denoise %.2f ms | AS %.2f ms | %.1f MiB",rendering.traceMs,rendering.denoiseMs,rendering.accelerationMs,rendering.ptBytes/1048576.);
             ImGui::Text("GPU %.2f ms | GI %.2f ms", rendering.gpuMs, rendering.giMs);
             ImGui::Text("Draws %u | GI bricks updated %u", rendering.drawCalls,
                         rendering.pendingGi);
@@ -1061,10 +1287,10 @@ int runApp(const AppOptions &options) {
             ImGui::End();
         }
         if (!options.noUi && state.showEvents) {
-            ImGui::SetNextWindowPos({ImGui::GetIO().DisplaySize.x - 320, 737},
-                                    ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowPos({ImGui::GetIO().DisplaySize.x - 12, 737}, ImGuiCond_Always,
+                                    {1, 0});
             ImGui::SetNextWindowSize({308, 260}, ImGuiCond_FirstUseEver);
-            ImGui::Begin("EVENT LOG", &state.showEvents);
+            ImGui::Begin("EVENT LOG", &state.showEvents, ImGuiWindowFlags_NoMove);
             for (const Event &e : engine.events)
                 ImGui::Text("[%llu] %s", static_cast<unsigned long long>(e.tick),
                             e.message.c_str());
@@ -1074,12 +1300,19 @@ int runApp(const AppOptions &options) {
         float cameraView[16];
         camera.view(cameraView);
         renderer.begin(camera.eye(), cameraView);
-        renderer.drawWorld(engine.world, options.editor && state.stress);
+        renderer.drawWorld(
+            engine.world, options.editor && state.stress,
+            engine.playerSettings().enabled
+                ? (network.isClient() ? network.presentedPlayers() : engine.players())
+                : std::map<PlayerId, PlayerState>{},
+            characterMode ? (network.isClient() ? network.localPlayer() : 1) : 0);
         renderer.drawImGui(ImGui::GetDrawData());
         if (!options.screenshot.empty() && !captured &&
-            frames >= std::max(4, options.frameLimit - 2)) {
+            (options.ptCaptureSamples ? renderer.accumulatedSamples() >= uint32_t(options.ptCaptureSamples)
+                                      : frames >= std::max(4, options.frameLimit - 2))) {
             renderer.screenshot(options.screenshot);
             captured = true;
+            if (options.ptCaptureSamples) running = false;
         }
         renderer.end();
         if (options.renderSmoke && options.editor && landscapeSmokeStage > 0 &&
@@ -1180,6 +1413,12 @@ int runApp(const AppOptions &options) {
         }
         if (restartRequested) {
             engine.loadProject(options.project);
+            if (characterMode)
+                engine.addPlayer(1);
+            network.resetRound(engine);
+            playerGeneration = 0;
+            previousPredicted.reset();
+            visualCorrection = {};
             renderer.invalidateMeshes();
             state = {};
             state.material = 2;
@@ -1189,7 +1428,7 @@ int runApp(const AppOptions &options) {
                 state.selected = engine.world.objects.begin()->first;
         }
         ++frames;
-        if (options.frameLimit > 0 && frames >= options.frameLimit)
+        if (options.frameLimit > 0 && frames >= options.frameLimit && !options.ptCaptureSamples)
             running = false;
     }
     if (benchmarking)

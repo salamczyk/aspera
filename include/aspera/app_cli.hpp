@@ -6,6 +6,18 @@
 #include <string_view>
 
 namespace aspera {
+// Parses a required integral flag value, rejecting a missing value, trailing
+// characters, and anything outside the target type's range.
+template <class T> void parseInteger(T &out, std::string_view arg, int &i, int argc, char **argv) {
+    if (++i >= argc)
+        throw std::runtime_error("Missing value for " + std::string(arg));
+    const std::string_view text(argv[i]);
+    T value{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size())
+        throw std::runtime_error("Invalid value for " + std::string(arg));
+    out = value;
+}
 // Shared player/editor rendering switches. Returns false for an unrelated flag.
 inline bool parseRenderOption(AppOptions &options, std::string_view arg, int &i, int argc,
                               char **argv) {
@@ -23,7 +35,16 @@ inline bool parseRenderOption(AppOptions &options, std::string_view arg, int &i,
             throw std::runtime_error("Invalid value for " + std::string(arg));
         return result;
     };
-    if (arg == "--quality") {
+    if (arg == "--renderer") {
+        auto text = value();
+        if (text != "raster" && text != "path-traced")
+            throw std::runtime_error("Renderer must be raster or path-traced");
+        options.pathTracing = text == "path-traced";
+    } else if (arg == "--pt-samples") options.ptSamples = integer(1, 64);
+    else if (arg == "--pt-bounces") options.ptBounces = integer(1, 12);
+    else if (arg == "--pt-capture-samples") options.ptCaptureSamples = integer(1, 1048576);
+    else if (arg == "--pt-no-denoise") options.ptNoDenoise = true;
+    else if (arg == "--quality") {
         auto text = value();
         if (text != "balanced" && text != "low")
             throw std::runtime_error("Quality must be balanced or low");
@@ -86,6 +107,8 @@ inline bool parseRenderOption(AppOptions &options, std::string_view arg, int &i,
     return true;
 }
 inline constexpr const char *RenderOptionHelp =
+    "  --renderer raster|path-traced --pt-samples 1..64 --pt-bounces 1..12\n"
+    "  --pt-no-denoise --pt-capture-samples n (offline frozen reference)\n"
     "  --quality balanced|low --no-bloom --no-ui --fixed-step --render-smoke\n"
     "  --width pixels --height pixels --camera x,y,z,yaw,pitch\n"
     "  --debug-view final|material|direct|shadows|indirect|ao|voxels\n"

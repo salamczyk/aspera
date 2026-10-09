@@ -153,4 +153,8 @@ struct ImportedScene {
 ImportedScene importVox(const std::filesystem::path &, float voxelSize = 0.1f);
 void writeAsset(const ImportedScene &, const std::filesystem::path &);
 ImportedScene readAsset(const std::filesystem::path &);
+// Same parsers over an in-memory image. Both treat the bytes as untrusted and
+// throw on anything malformed, so they are the entry points fuzz targets use.
+ImportedScene importVox(const std::vector<uint8_t> &, float voxelSize = 0.1f);
+ImportedScene readAsset(const std::vector<uint8_t> &);
 } // namespace aspera

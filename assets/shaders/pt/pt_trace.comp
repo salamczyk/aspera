@@ -1,0 +1,389 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+
+#include "pt_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std140, set = 0, binding = 0) uniform PtParamsBlock { PtParams params; };
+layout(std430, set = 0, binding = 1) readonly buffer PtVertexBlock { PtVertex vertices[]; };
+layout(std430, set = 0, binding = 2) readonly buffer PtIndexBlock { uint indices[]; };
+layout(std430, set = 0, binding = 3) readonly buffer PtInstanceBlock { PtInstance instances[]; };
+layout(std430, set = 0, binding = 4) readonly buffer PtMaterialBlock { PtMaterial materials[]; };
+layout(std430, set = 0, binding = 5) readonly buffer PtLightBlock { PtLight lights[]; };
+layout(std430, set = 0, binding = 6) readonly buffer PtEmitterBlock { PtEmitter emitters[]; };
+layout(set = 0, binding = 7) uniform accelerationStructureEXT sceneAS;
+
+layout(set = 0, binding = 8, rgba32f) uniform writeonly image2D rawDiffuse;
+layout(set = 0, binding = 9, rgba32f) uniform writeonly image2D rawSpecular;
+layout(set = 0, binding = 10, rgba32f) uniform writeonly image2D guideImage;
+layout(set = 0, binding = 11, rgba32f) uniform writeonly image2D albedoImage;
+layout(set = 0, binding = 12, rgba32f) uniform writeonly image2D motionImage;
+
+struct PtHit {
+    bool hit;
+    float distance;
+    vec3 position;
+    vec3 previousPosition;
+    vec3 normal;
+    vec3 base;
+    float roughness;
+    float metallic;
+    vec3 emission;
+    uint stableId;
+    uint materialId;
+};
+
+PtHit ptEmptyHit() {
+    PtHit h;
+    h.hit = false;
+    h.distance = 0.0;
+    h.position = vec3(0.0);
+    h.previousPosition = vec3(0.0);
+    h.normal = vec3(0.0, 1.0, 0.0);
+    h.base = vec3(0.0);
+    h.roughness = 1.0;
+    h.metallic = 0.0;
+    h.emission = vec3(0.0);
+    h.stableId = 0u;
+    h.materialId = 0u;
+    return h;
+}
+
+bool ptTraceClosest(vec3 origin, vec3 direction, out PtHit hit) {
+    hit = ptEmptyHit();
+    if (params.options.w == 0u) return false;
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, sceneAS, gl_RayFlagsOpaqueEXT, 0xffu,
+                          origin, 0.0005, direction, 1.0e30);
+    while (rayQueryProceedEXT(query)) { }
+    if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
+        return false;
+    // The TLAS stores the scene-array slot in instanceCustomIndex.  Use that
+    // value rather than the compact TLAS instance index because invalid or
+    // asynchronously retired BLAS entries may be skipped while publishing.
+    uint instanceId = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
+    uint primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+    if (instanceId >= params.options.w) return false;
+    PtInstance instance = instances[instanceId];
+    uint baseIndex = instance.offsets.x + primitiveId * 3u;
+    uint i0 = instance.offsets.y + indices[baseIndex + 0u];
+    uint i1 = instance.offsets.y + indices[baseIndex + 1u];
+    uint i2 = instance.offsets.y + indices[baseIndex + 2u];
+    PtVertex v0 = vertices[i0];
+    PtVertex v1 = vertices[i1];
+    PtVertex v2 = vertices[i2];
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);
+    vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+    vec3 localPosition = v0.position.xyz * weights.x + v1.position.xyz * weights.y + v2.position.xyz * weights.z;
+    vec3 localNormal = ptSafeNormalize(v0.normal.xyz * weights.x + v1.normal.xyz * weights.y + v2.normal.xyz * weights.z,
+                                        vec3(0.0, 1.0, 0.0));
+    vec4 worldPosition = instance.model * vec4(localPosition, 1.0);
+    vec3 worldNormal = ptSafeNormalize(transpose(mat3(instance.inverse)) * localNormal,
+                                       vec3(0.0, 1.0, 0.0));
+    if (dot(worldNormal, direction) > 0.0) worldNormal = -worldNormal;
+    uint materialId = uint(max(v0.color.w * weights.x + v1.color.w * weights.y + v2.color.w * weights.z, 0.0) + 0.5);
+    PtMaterial material = materials[materialId];
+    hit.hit = true;
+    hit.distance = rayQueryGetIntersectionTEXT(query, true);
+    hit.position = worldPosition.xyz / max(abs(worldPosition.w), 1.0e-8);
+    vec4 previousWorldPosition = instance.previous * vec4(localPosition, 1.0);
+    hit.previousPosition = previousWorldPosition.xyz / max(abs(previousWorldPosition.w), 1.0e-8);
+    hit.normal = worldNormal;
+    hit.base = clamp(material.baseRoughness.xyz, vec3(0.0), vec3(1.0));
+    hit.roughness = clamp(material.baseRoughness.w, 0.05, 1.0);
+    hit.metallic = clamp(material.emissionMetallic.w, 0.0, 1.0);
+    hit.emission = max(material.emissionMetallic.xyz, vec3(0.0));
+    hit.stableId = instance.offsets.z;
+    hit.materialId = materialId;
+    return true;
+}
+
+bool ptOccluded(vec3 origin, vec3 direction, float distance) {
+    if (params.options.w == 0u || distance <= 0.0005) return false;
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, sceneAS, gl_RayFlagsOpaqueEXT, 0xffu,
+                          origin, 0.0005, direction, max(distance - 0.001, 0.0006));
+    while (rayQueryProceedEXT(query)) { }
+    return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+}
+
+void ptAddSun(PtHit h, vec3 view, vec3 throughput, bool continuation,
+              inout vec3 diffuseOut, inout vec3 specularOut, inout uint rng) {
+    vec3 sun = ptSunDirection(params);
+    float c = ptSunCosine(params);
+    float u0 = ptRandom(rng);
+    float u1 = ptRandom(rng);
+    float cosTheta = mix(1.0, c, u0);
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = PT_TWO_PI * u1;
+    vec3 lightDirection = ptToWorld(vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta), sun);
+    float noL = max(dot(h.normal, lightDirection), 0.0);
+    if (noL <= 0.0 || ptOccluded(h.position + h.normal * 0.001, lightDirection, 1.0e30)) return;
+    vec3 fd, fs;
+    float pd, ps, mixture;
+    ptEvalBsdf(h.base, h.metallic, h.roughness, h.normal, view, lightDirection,
+               fd, fs, pd, ps, mixture);
+    float lightPdf = ptSunPdf(lightDirection, params);
+    float weight = continuation ? ptPowerHeuristic(lightPdf, mixture) : 1.0;
+    vec3 li = ptSunRadiance(params);
+    diffuseOut += throughput * fd * li * noL * weight / max(lightPdf, 1.0e-8);
+    specularOut += throughput * fs * li * noL * weight / max(lightPdf, 1.0e-8);
+}
+
+void ptAddSky(PtHit h, vec3 view, vec3 throughput, bool continuation,
+              inout vec3 diffuseOut, inout vec3 specularOut, inout uint rng) {
+    float lightPdf;
+    vec3 lightDirection = ptSampleCosine(h.normal, rng, lightPdf);
+    if (ptInSunDisk(lightDirection, params)) return;
+    if (ptOccluded(h.position + h.normal * 0.001, lightDirection, 1.0e30)) return;
+    vec3 fd, fs;
+    float pd, ps, mixture;
+    ptEvalBsdf(h.base, h.metallic, h.roughness, h.normal, view, lightDirection,
+               fd, fs, pd, ps, mixture);
+    float weight = continuation ? ptPowerHeuristic(lightPdf, mixture) : 1.0;
+    vec3 li = ptSkyOnly(lightDirection, params);
+    float noL = max(dot(h.normal, lightDirection), 0.0);
+    diffuseOut += throughput * fd * li * noL * weight / max(lightPdf, 1.0e-8);
+    specularOut += throughput * fs * li * noL * weight / max(lightPdf, 1.0e-8);
+}
+
+void ptAddPointLight(PtHit h, vec3 view, vec3 throughput, inout vec3 diffuseOut,
+                     inout vec3 specularOut, inout uint rng) {
+    uint count = params.counts.z;
+    if (count == 0u) return;
+    uint lightId = min(uint(ptRandom(rng) * float(count)), count - 1u);
+    PtLight light = lights[lightId];
+    vec3 delta = light.positionRange.xyz - h.position;
+    float distance = length(delta);
+    if (distance <= 0.001 || distance > max(light.positionRange.w, 0.001)) return;
+    vec3 l = delta / distance;
+    float noL = max(dot(h.normal, l), 0.0);
+    if (noL <= 0.0) return;
+    float spot = 1.0;
+    if (light.directionType.w > 0.5) {
+        float c = dot(-l, ptSafeNormalize(light.directionType.xyz, vec3(0.0, -1.0, 0.0)));
+        spot = light.cone.x - light.cone.y > 1.0e-5
+            ? smoothstep(light.cone.y, light.cone.x, c) : step(light.cone.y, c);
+        if (spot <= 0.0) return;
+    }
+    if (light.cone.z > 0.5 && ptOccluded(h.position + h.normal * 0.001, l, distance)) return;
+    vec3 fd, fs;
+    float pd, ps, mixture;
+    ptEvalBsdf(h.base, h.metallic, h.roughness, h.normal, view, l, fd, fs, pd, ps, mixture);
+    // colorIntensity.w is already normalized by the authored source's
+    // spherical solid angle on the CPU.  Apply the same finite-range fade as
+    // the raster backend without dividing by 4*pi a second time.
+    float edge = clamp(1.0 - pow(distance / max(light.positionRange.w, 0.001), 4.0), 0.0, 1.0);
+    float attenuation = edge * edge / max(distance * distance, 0.01);
+    vec3 li = max(light.colorIntensity.xyz, vec3(0.0)) * max(light.colorIntensity.w, 0.0) *
+              spot * attenuation;
+    float sampleScale = float(count);
+    diffuseOut += throughput * fd * li * noL * sampleScale;
+    specularOut += throughput * fs * li * noL * sampleScale;
+}
+
+bool ptChooseEmitter(inout uint rng, out PtEmitter emitter, out float selectionPdf) {
+    uint count = params.counts.w;
+    if (count == 0u) return false;
+    float pick = ptRandom(rng);
+    uint chosen = count - 1u;
+    float previous = 0.0;
+    for (uint i = 0u; i < count; ++i) {
+        float cdf = emitters[i].bCdf.w;
+        if (pick <= cdf) {
+            chosen = i;
+            selectionPdf = emitters[i].radiance.w > 0.0 ? emitters[i].radiance.w : max(cdf - previous, 1.0e-8);
+            emitter = emitters[i];
+            return true;
+        }
+        previous = cdf;
+    }
+    emitter = emitters[chosen];
+    selectionPdf = emitter.radiance.w > 0.0 ? emitter.radiance.w : max(emitter.bCdf.w - previous, 1.0e-8);
+    return true;
+}
+
+void ptAddEmitter(PtHit h, vec3 view, vec3 throughput, bool continuation,
+                  inout vec3 diffuseOut, inout vec3 specularOut, inout uint rng) {
+    PtEmitter emitter;
+    float selectionPdf;
+    if (!ptChooseEmitter(rng, emitter, selectionPdf)) return;
+    float su = sqrt(ptRandom(rng));
+    float sv = ptRandom(rng);
+    vec3 a = emitter.aArea.xyz;
+    vec3 b = emitter.bCdf.xyz;
+    vec3 c = emitter.cPad.xyz;
+    vec3 lightPosition = a * (1.0 - su) + b * (su * (1.0 - sv)) + c * (su * sv);
+    vec3 lightNormal = ptSafeNormalize(cross(b - a, c - a), vec3(0.0, 1.0, 0.0));
+    vec3 delta = lightPosition - h.position;
+    float distance2 = dot(delta, delta);
+    if (distance2 <= 1.0e-6) return;
+    float distance = sqrt(distance2);
+    vec3 l = delta / distance;
+    float noL = max(dot(h.normal, l), 0.0);
+    float lightNoL = max(dot(lightNormal, -l), 0.0);
+    float area = max(emitter.aArea.w, 1.0e-8);
+    if (noL <= 0.0 || lightNoL <= 0.0 || ptOccluded(h.position + h.normal * 0.001, l, distance)) return;
+    float pdf = selectionPdf * distance2 / max(area * lightNoL, 1.0e-8);
+    vec3 fd, fs;
+    float pd, ps, mixture;
+    ptEvalBsdf(h.base, h.metallic, h.roughness, h.normal, view, l, fd, fs, pd, ps, mixture);
+    float weight = continuation ? ptPowerHeuristic(pdf, mixture) : 1.0;
+    vec3 li = max(emitter.radiance.xyz, vec3(0.0));
+    diffuseOut += throughput * fd * li * noL * weight / max(pdf, 1.0e-8);
+    specularOut += throughput * fs * li * noL * weight / max(pdf, 1.0e-8);
+}
+
+float ptEmitterPdfAtPoint(vec3 origin, vec3 point, vec3 direction) {
+    uint count = params.counts.w;
+    float distance2 = dot(point - origin, point - origin);
+    if (distance2 <= 1.0e-8) return 0.0;
+    for (uint i = 0u; i < count; ++i) {
+        PtEmitter emitter = emitters[i];
+        vec3 a = emitter.aArea.xyz, b = emitter.bCdf.xyz, c = emitter.cPad.xyz;
+        vec3 ab = b - a, ac = c - a, ap = point - a;
+        float d00 = dot(ab, ab), d01 = dot(ab, ac), d11 = dot(ac, ac);
+        float d20 = dot(ap, ab), d21 = dot(ap, ac);
+        float denom = d00 * d11 - d01 * d01;
+        if (abs(denom) < 1.0e-8) continue;
+        float v = (d11 * d20 - d01 * d21) / denom;
+        float w = (d00 * d21 - d01 * d20) / denom;
+        vec3 closest = a + ab * v + ac * w;
+        if (v < -0.002 || w < -0.002 || v + w > 1.002 || dot(closest - point, closest - point) > 0.0001) continue;
+        vec3 normal = ptSafeNormalize(cross(ab, ac), vec3(0.0, 1.0, 0.0));
+        float lightCos = abs(dot(normal, -direction));
+        if (lightCos <= 1.0e-6) return 0.0;
+        return max(emitter.radiance.w, 0.0) * distance2 /
+               max(emitter.aArea.w * lightCos, 1.0e-8);
+    }
+    return 0.0;
+}
+
+void ptAddEnvironment(vec3 direction, vec3 normal, vec3 throughput, float previousPdf,
+                      bool lastSpecular, inout vec3 diffuseOut, inout vec3 specularOut) {
+    bool sun = ptInSunDisk(direction, params);
+    vec3 li = sun ? ptSunRadiance(params) : ptSkyOnly(direction, params);
+    float environmentPdf = sun ? ptSunPdf(direction, params) : ptSkyPdf(direction, normal, params);
+    float weight = previousPdf > 0.0 ? ptPowerHeuristic(previousPdf, environmentPdf) : 1.0;
+    vec3 value = throughput * li * weight;
+    if (lastSpecular) specularOut += value;
+    else diffuseOut += value;
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    uvec2 size = params.sizeFrame.xy;
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+    uint sampleCount = min(params.counts.x, 64u);
+    if (sampleCount == 0u) {
+        imageStore(rawDiffuse, ivec2(pixel), vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(rawSpecular, ivec2(pixel), vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(guideImage, ivec2(pixel), vec4(0.0));
+        imageStore(albedoImage, ivec2(pixel), vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(motionImage, ivec2(pixel), vec4(-1.0));
+        return;
+    }
+    vec3 diffuseSum = vec3(0.0);
+    vec3 specularSum = vec3(0.0);
+    PtHit primary = ptEmptyHit();
+    vec3 primaryDirection = vec3(0.0, 0.0, -1.0);
+    uint bounceLimit = clamp(params.counts.y, 1u, 12u);
+    for (uint sampleIndex = 0u; sampleIndex < sampleCount; ++sampleIndex) {
+        uint globalSampleIndex = params.sizeFrame.z + sampleIndex;
+        // The sample stream is a function only of pixel and global sample;
+        // history resets must not change the Monte Carlo sequence.
+        uint seed = ptHash(pixel.x + pixel.y * 65537u + globalSampleIndex * 747796405u);
+        vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
+        uv += (vec2(ptRandom(seed), ptRandom(seed)) - vec2(0.5)) / vec2(size);
+        vec3 nearPoint = ptUnproject(uv, 0.0, params.inverseVP);
+        vec3 farPoint = ptUnproject(uv, 1.0, params.inverseVP);
+        vec3 direction = ptSafeNormalize(farPoint - nearPoint, vec3(0.0, 0.0, -1.0));
+        if (sampleIndex == 0u) primaryDirection = direction;
+        vec3 origin = params.eye.xyz;
+        vec3 diffuseOut = vec3(0.0);
+        vec3 specularOut = vec3(0.0);
+        vec3 throughput = vec3(1.0);
+        vec3 previousNormal = -direction;
+        float previousPdf = 0.0;
+        bool lastSpecular = false;
+        for (uint bounce = 0u; bounce < 12u; ++bounce) {
+            if (bounce >= bounceLimit) break;
+            PtHit hit;
+            if (!ptTraceClosest(origin, direction, hit)) {
+                ptAddEnvironment(direction, previousNormal, throughput, previousPdf, lastSpecular,
+                                 diffuseOut, specularOut);
+                break;
+            }
+            if (sampleIndex == 0u && bounce == 0u) primary = hit;
+            if (max(hit.emission.x, max(hit.emission.y, hit.emission.z)) > 0.0) {
+                float emitterPdf = ptEmitterPdfAtPoint(origin, hit.position, direction);
+                float emissionWeight = previousPdf > 0.0 && emitterPdf > 0.0 ?
+                                       ptPowerHeuristic(previousPdf, emitterPdf) : 1.0;
+                vec3 emitted = throughput * hit.emission * emissionWeight;
+                if (lastSpecular) specularOut += emitted;
+                else diffuseOut += emitted;
+            }
+            vec3 view = ptSafeNormalize(-direction, hit.normal);
+            bool continuation = bounce + 1u < bounceLimit;
+            ptAddSun(hit, view, throughput, continuation, diffuseOut, specularOut, seed);
+            ptAddPointLight(hit, view, throughput, diffuseOut, specularOut, seed);
+            ptAddSky(hit, view, throughput, continuation, diffuseOut, specularOut, seed);
+            ptAddEmitter(hit, view, throughput, continuation, diffuseOut, specularOut, seed);
+            if (!continuation) break;
+            vec3 nextDirection, bsdfValue;
+            float bsdfPdf;
+            bool sampledSpecular;
+            if (!ptSampleBsdf(hit.base, hit.metallic, hit.roughness, hit.normal, view,
+                              seed, nextDirection, bsdfValue, bsdfPdf, sampledSpecular)) break;
+            float noL = max(dot(hit.normal, nextDirection), 0.0);
+            throughput *= bsdfValue * noL / max(bsdfPdf, 1.0e-8);
+            if (bounce >= 2u) {
+                float survival = clamp(ptMax3(throughput), 0.05, 0.95);
+                if (ptRandom(seed) > survival) break;
+                throughput /= survival;
+            }
+            previousNormal = hit.normal;
+            previousPdf = bsdfPdf;
+            lastSpecular = sampledSpecular;
+            origin = hit.position + hit.normal * (dot(hit.normal, nextDirection) >= 0.0 ? 0.001 : -0.001);
+            direction = nextDirection;
+        }
+        diffuseSum += diffuseOut;
+        specularSum += specularOut;
+    }
+
+    float sampleScale = 1.0 / float(sampleCount);
+    vec3 diffuseOut = diffuseSum * sampleScale;
+    vec3 specularOut = specularSum * sampleScale;
+    vec4 guide = vec4(0.0, 0.0, 0.0, 0.0);
+    vec4 albedo = vec4(0.0, 0.0, 0.0, 1.0);
+    vec4 motion = vec4(-1.0);
+    if (primary.hit) {
+        guide = vec4(primary.normal, primary.distance);
+        albedo = vec4(primary.base, primary.roughness);
+        vec4 previousClip = params.previousVP * vec4(primary.previousPosition, 1.0);
+        if (previousClip.w > 1.0e-8) {
+            vec2 previousUv = previousClip.xy / previousClip.w * 0.5 + 0.5;
+            previousUv.y = 1.0 - previousUv.y;
+            motion = vec4(previousUv, float(primary.stableId), float(primary.materialId));
+        }
+    } else {
+        // Sky has no surface identity, but its radiance still needs a motion
+        // vector when the camera rotates so the temporal pass can reproject
+        // the previous environment sample.
+        vec4 previousClip = params.previousVP * vec4(primaryDirection, 0.0);
+        if (previousClip.w > 1.0e-8) {
+            vec2 previousUv = previousClip.xy / previousClip.w * 0.5 + 0.5;
+            previousUv.y = 1.0 - previousUv.y;
+            motion = vec4(previousUv, 0.0, 0.0);
+        }
+    }
+    imageStore(rawDiffuse, ivec2(pixel), vec4(max(diffuseOut, vec3(0.0)), 1.0));
+    imageStore(rawSpecular, ivec2(pixel), vec4(max(specularOut, vec3(0.0)), 1.0));
+    imageStore(guideImage, ivec2(pixel), guide);
+    imageStore(albedoImage, ivec2(pixel), albedo);
+    imageStore(motionImage, ivec2(pixel), motion);
+}

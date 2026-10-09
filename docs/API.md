@@ -72,6 +72,42 @@ Balanced shadows at most two local lights; other lights still illuminate. Point 
 
 `project.lua` returns a table with `name`. `scene.lua` initializes the scene. An existing `scene.aspera` then replaces that initial world. `server.lua` defines `update(dt)` and optionally `on_event(type, entity, command, message, details)`. Runtime gameplay and lighting mutations run on the authority. Clients display replicated state; their native HUD is the current presentation layer.
 
+An optional `player` table opts a project into transient first-person character
+sessions. Projects without it keep the free-flight camera and do not allocate
+player state. The table uses this shape:
+
+```lua
+player = {
+  mode = 'first_person',
+  build_material = 5,
+  spawns = {
+    {x = -6.5, y = 0.03, z = -6, yaw = 0.75, pitch = 0},
+    {x =  6.5, y = 0.03, z = -6, yaw = -0.75, pitch = 0},
+  },
+  bounds = {
+    min = {x = -9, y = -4, z = -9},
+    max = {x =  9, y =  8, z =  9},
+  },
+}
+```
+
+`mode` is currently `first_person`; `spawns` are feet positions and view angles,
+and `bounds` are world-space playable limits. The loader validates finite values,
+ordered bounds, one to sixteen spawn poses, and a build material present in the
+palette. The controller uses a 1.8 m capsule with 0.3 m radius, 1.65 m eye
+height, 4 m/s walk speed, 5 m/s jump velocity, 9.81 m/s² gravity, a 45° slope
+limit, and a 0.3 m step height. These are runtime defaults rather than saved
+world fields. Recovery clears velocity and chooses a capsule-clear authored spawn
+or a nearby tested offset; a blocked spawn remains flagged for retry.
+
+The C++ session API exposes `PlayerId`, `PlayerInput`, and `PlayerState` through
+`Engine::playerSettings()`, `Engine::players()`, `addPlayer`, `removePlayer`,
+`submitPlayerInput`, `setPlayerStates`, `resetPlayers`, `predictPlayer`,
+`predictedPlayer`, `predictionHistorySize`, and `clearPrediction`. Player state
+is session-owned: it is excluded from voxel objects, structural graphs, undo,
+saves, and world checksums. `playerCollisionRevision(world)` identifies the
+published collision geometry used by reconciliation.
+
 | Function | Contract |
 |---|---|
 | `engine.spawn_box(name,x,y,z,nx,ny,nz,material,anchored)` | Scene initialization only. Dimensions are cell counts; position is metres. Returns entity ID. |
@@ -112,9 +148,28 @@ World and cooked-asset writers emit **version 3**. Readers accept versions 1, 2,
 
 Snapshots have explicit little-endian fields, magic/version headers, bounded counts, and validation before publication. They preserve material definitions, cells, damage, seams, transforms, velocities, anchors, joints, numeric script state, environment, lights, and allocators. Saves write a sibling temporary file and atomically replace the destination; failures are reported.
 
-The handshake requires **protocol 3** and a matching game-content fingerprint. Reliable ordered blocks transmit initial worlds and changed objects. Material/environment/light state, light removals, allocators, properties, joints, and object deletions accompany transactions, including lighting-only updates. Clients verify a checksum before publication and request resynchronization on mismatch. Motion snapshots are sent at 20 Hz and interpolated. Commands are sequenced and rate/size bounded.
+The handshake requires **protocol 4** and a matching game-content fingerprint. Reliable ordered blocks transmit initial worlds and changed objects. Material/environment/light state, light removals, allocators, properties, joints, and object deletions accompany transactions, including lighting-only updates. Clients verify a checksum before publication and request resynchronization on mismatch. Moving-body snapshots are sent at 20 Hz and interpolated. Commands are sequenced and rate/size bounded.
 
-This development protocol supports three remote peers. It has no account identity, authentication, encrypted transport, public matchmaking, or host migration. Player movement prediction and adversarial-server hardening remain outside the current implementation.
+Player input is sampled at 60 Hz, sent in bounded redundant batches, and
+acknowledged by the authoritative player snapshot. One-shot jump, damage, build,
+and recovery flags are consumed once; movement frames may be repeated briefly
+during silence. Player snapshots include the acknowledged input sequence,
+recovery generation, support entity, and collision revision. A local prediction
+history is bounded to two seconds; a missing history entry or unavailable
+geometry causes a clean reset. Remote poses are interpolated, while newly
+fractured or fast-moving debris can still cause a small correction because
+prediction uses sampled kinematic obstacles.
+
+The co-op protocol supports four player IDs: a listen host plus three remote
+players, or four remote players on a dedicated authority. ENet channel 0 carries reliable
+world transactions, channel 1 moving-body snapshots, and channel 2 player
+membership, input, and player snapshots. The host assigns IDs 1 through 4 after
+the content handshake; an offline/listen-host player occupies one slot and a
+dedicated server creates only remote slots. Roster and poses are included in
+late-join initialization. Disconnect removes the player's queued input. A
+reliable round reset clears prediction and refreshes the roster; only the host
+can request it. The protocol still has no account identity, authentication,
+encrypted transport, public matchmaking, or host migration.
 
 ## Collision destruction
 

@@ -23,6 +23,8 @@ Run these commands from the repository root:
 ```sh
 ./build/aspera_editor --project games/demolition
 ./build/aspera_player --project games/demolition
+./build/aspera_editor --project games/quarry-demolition
+./build/aspera_player --project games/quarry-demolition
 ./build/aspera_player --project games/construction
 ./build/aspera_editor --project games/collision
 ```
@@ -42,18 +44,26 @@ roughness, metalness, and emission in the material Inspector.
 ```
 
 ```sh
-# Host plus three remote players
-./build/aspera_player --project games/demolition --host
-./build/aspera_player --project games/demolition --connect 127.0.0.1
+# Host plus three remote players in the first-person quarry
+./build/aspera_player --project games/quarry-demolition --host
+./build/aspera_player --project games/quarry-demolition --connect 127.0.0.1
 
 # Headless authority; direct connection uses UDP port 24680
-./build/aspera_server --project games/construction --port 24680
+./build/aspera_server --project games/quarry-demolition --port 24680
 
 # Finite offline smoke test and save
-./build/aspera_server --project games/demolition --no-network --ticks 120 --save /tmp/world.sav
+./build/aspera_server --project games/quarry-demolition --no-network --ticks 120 --save /tmp/quarry.sav
 ```
 
-Internet clients need a reachable host address/port. There is no relay, lobby service, or host migration. All peers must have the same game content. Co-op currently replicates world edits and moving fragments; the full player-character prediction/reconciliation system remains unfinished.
+Internet clients need a reachable host address/port. There is no relay, lobby service, or host migration. All peers must have the same game content. The player session adds movement and pose replication to the existing authoritative world-edit and moving-fragment protocol.
+
+`games/quarry-demolition` opts into the first-person player session. The host
+assigns up to four transient player IDs, simulates grounded capsule movement,
+and owns damage/build tool intents. Player state is replicated over protocol 4;
+it is not written to the version-3 world save. The local client predicts against
+published collision geometry and corrects when the authority has moved debris or
+rebuilt a collision revision, so newly fractured rubble can produce a visible
+small correction.
 
 ## Landscapes
 
@@ -77,6 +87,8 @@ limits, the quarry collapse demo, and benchmark commands.
 ./build/aspera_editor --project out/my-game
 ./build/aspera_cooker --package games/demolition out/demolition
 ./out/demolition/Play.sh
+./build/aspera_cooker --package games/quarry-demolition out/quarry-demolition
+./out/quarry-demolition/Play.sh
 ```
 
 Packages include the player, server, compiled shaders, and game content; they run on the operating system on which they were built. Build and export on each target OS. The output directory must be empty. The editor can import `.vox` and cooked `.avox` files. Imported assets initially behave as dynamic objects; add foundation anchors for static structures.
@@ -107,3 +119,7 @@ fixture, after warm-up, with CPU/GPU percentiles and raw pass timings. Run
 See [rendering](docs/RENDERING.md), [fixtures](docs/LIGHTING_FIXTURES.md), and
 [local validation](docs/VALIDATION.md). The M1/GTX 1660 gate remains unqualified
 until both target GPUs pass; results on the available M3 are development evidence.
+
+An optional native path-tracing renderer is available with `--renderer path-traced`.
+See [path tracing](docs/PATH_TRACING.md) for GPU requirements, reference captures,
+and the separate 1080p/30 fps qualification target.

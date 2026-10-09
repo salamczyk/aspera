@@ -1,10 +1,107 @@
 {
   "version": 3,
   "configurePresets": [
-    {"name":"dev","generator":"Ninja","binaryDir":"${sourceDir}/build","cacheVariables":{"CMAKE_BUILD_TYPE":"RelWithDebInfo"}},
-    {"name":"server","inherits":"dev","binaryDir":"${sourceDir}/build-server","cacheVariables":{"ASPERA_DESKTOP":"OFF"}},
-    {"name":"core","inherits":"dev","binaryDir":"${sourceDir}/build-core","cacheVariables":{"ASPERA_CORE_ONLY":"ON"}}
+    {
+      "name": "dev",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "server",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build-server",
+      "cacheVariables": {
+        "ASPERA_DESKTOP": "OFF"
+      }
+    },
+    {
+      "name": "core",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build-core",
+      "cacheVariables": {
+        "ASPERA_CORE_ONLY": "ON"
+      }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "server",
+      "binaryDir": "${sourceDir}/build-fuzz",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ASPERA_FUZZ": "ON",
+        "ASPERA_SANITIZE": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "inherits": "server",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ASPERA_SANITIZE": "ON"
+      }
+    }
   ],
-  "buildPresets":[{"name":"dev","configurePreset":"dev"},{"name":"server","configurePreset":"server"},{"name":"core","configurePreset":"core"}],
-  "testPresets":[{"name":"dev","configurePreset":"dev","output":{"outputOnFailure":true}},{"name":"server","configurePreset":"server","output":{"outputOnFailure":true}},{"name":"core","configurePreset":"core","output":{"outputOnFailure":true}}]
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "server",
+      "configurePreset": "server"
+    },
+    {
+      "name": "core",
+      "configurePreset": "core"
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "server",
+      "configurePreset": "server",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "core",
+      "configurePreset": "core",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
 }

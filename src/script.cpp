@@ -7,6 +7,7 @@ extern "C" {
 #include <algorithm>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 
 namespace aspera {
 struct Scripts::Impl {
@@ -21,6 +22,14 @@ struct Scripts::Impl {
     }
     static Impl &self(lua_State *L) {
         return *static_cast<Impl *>(lua_touserdata(L, lua_upvalueindex(1)));
+    }
+    // error() accepts any Lua value, and lua_tostring returns null for a
+    // non-string, non-number one. Describe those instead of dereferencing null.
+    static std::string errorText(lua_State *L, int index) {
+        if (const char *text = lua_tostring(L, index))
+            return text;
+        const char *kind = luaL_typename(L, index);
+        return std::string("non-string script error (") + (kind ? kind : "?") + ")";
     }
     static void hook(lua_State *L, lua_Debug *) {
         luaL_error(L, "Script instruction budget exceeded");
@@ -470,7 +479,7 @@ struct Scripts::Impl {
         lua_sethook(L, hook, LUA_MASKCOUNT, 20000000);
         if (luaL_loadfile(L, path.string().c_str()) != LUA_OK ||
             lua_pcall(L, 0, results, 0) != LUA_OK) {
-            std::string error = lua_tostring(L, -1);
+            std::string error = errorText(L, -1);
             lua_pop(L, 1);
             lua_sethook(L, nullptr, 0, 0);
             throw std::runtime_error(error);
@@ -491,7 +500,86 @@ void Scripts::load(Engine &engine, const std::filesystem::path &path, bool initi
         lua_getfield(replacement->L, -1, "name");
         const char *title = lua_tostring(replacement->L, -1);
         name = title ? title : path.filename().string();
-        lua_pop(replacement->L, 2);
+        lua_pop(replacement->L, 1);
+        PlayerSettings settings;
+        auto *L = replacement->L;
+        auto number = [&](int table, const char *key, float fallback) {
+            lua_getfield(L, table, key);
+            float value = fallback;
+            if (!lua_isnil(L, -1)) {
+                if (!lua_isnumber(L, -1))
+                    throw std::runtime_error("Invalid player manifest number");
+                value = float(lua_tonumber(L, -1));
+                if (!std::isfinite(value) || std::abs(value) > 10000)
+                    throw std::runtime_error("Invalid player manifest range");
+            }
+            lua_pop(L, 1);
+            return value;
+        };
+        auto vector = [&](int table) {
+            return Vec3{number(table, "x", 0), number(table, "y", 0), number(table, "z", 0)};
+        };
+        lua_getfield(L, -1, "player");
+        if (!lua_isnil(L, -1)) {
+            if (!lua_istable(L, -1))
+                throw std::runtime_error("player must be a table");
+            int player = lua_gettop(L);
+            lua_getfield(L, player, "mode");
+            const char *mode = lua_tostring(L, -1);
+            if (!mode || std::string(mode) != "first_person")
+                throw std::runtime_error("player.mode must be first_person");
+            lua_pop(L, 1);
+            settings.enabled = true;
+            float material = number(player, "build_material", 5);
+            if (material < 1 || material >= engine.world.materials.size() ||
+                std::floor(material) != material)
+                throw std::runtime_error("Invalid player build material");
+            settings.buildMaterial = MaterialId(material);
+            lua_getfield(L, player, "spawns");
+            if (!lua_istable(L, -1) || lua_rawlen(L, -1) < 1 || lua_rawlen(L, -1) > 16)
+                throw std::runtime_error("player.spawns requires 1 to 16 poses");
+            int spawns = lua_gettop(L);
+            for (size_t n = 1; n <= lua_rawlen(L, spawns); ++n) {
+                lua_rawgeti(L, spawns, lua_Integer(n));
+                if (!lua_istable(L, -1))
+                    throw std::runtime_error("Invalid player spawn");
+                int pose = lua_gettop(L);
+                PlayerSpawn spawn{vector(pose), number(pose, "yaw", 0), number(pose, "pitch", 0)};
+                if (std::abs(spawn.pitch) > 1.45f)
+                    throw std::runtime_error("Invalid spawn pitch");
+                settings.spawns.push_back(spawn);
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+            lua_getfield(L, player, "bounds");
+            if (!lua_istable(L, -1))
+                throw std::runtime_error("player.bounds required");
+            int bounds = lua_gettop(L);
+            lua_getfield(L, bounds, "min");
+            if (!lua_istable(L, -1))
+                throw std::runtime_error("player.bounds.min required");
+            settings.minimum = vector(lua_gettop(L));
+            lua_pop(L, 1);
+            lua_getfield(L, bounds, "max");
+            if (!lua_istable(L, -1))
+                throw std::runtime_error("player.bounds.max required");
+            settings.maximum = vector(lua_gettop(L));
+            lua_pop(L, 1);
+            if (settings.minimum.x >= settings.maximum.x ||
+                settings.minimum.y >= settings.maximum.y ||
+                settings.minimum.z >= settings.maximum.z)
+                throw std::runtime_error("Invalid player bounds");
+            for (const auto &spawn : settings.spawns)
+                if (spawn.position.x < settings.minimum.x ||
+                    spawn.position.x > settings.maximum.x ||
+                    spawn.position.y < settings.minimum.y ||
+                    spawn.position.y + 1.8f > settings.maximum.y ||
+                    spawn.position.z < settings.minimum.z || spawn.position.z > settings.maximum.z)
+                    throw std::runtime_error("Player spawn outside bounds");
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 2);
+        playerSettings = std::move(settings);
         replacement->initializing = initialize;
         if (initialize)
             replacement->file(path / "scene.lua");
@@ -544,7 +632,7 @@ void Scripts::tick(Engine &engine, float dt) {
         }
         lua_sethook(p->L, Impl::hook, LUA_MASKCOUNT, 200000);
         if (lua_pcall(p->L, 5, 0, 0) != LUA_OK) {
-            engine.emit("script_error", 0, lua_tostring(p->L, -1));
+            engine.emit("script_error", 0, Impl::errorText(p->L, -1));
             lua_pop(p->L, 1);
             p->disabled = true;
             lua_sethook(p->L, nullptr, 0, 0);
@@ -560,7 +648,7 @@ void Scripts::tick(Engine &engine, float dt) {
     lua_pushnumber(p->L, dt);
     lua_sethook(p->L, Impl::hook, LUA_MASKCOUNT, 200000);
     if (lua_pcall(p->L, 1, 0, 0) != LUA_OK) {
-        engine.emit("script_error", 0, lua_tostring(p->L, -1));
+        engine.emit("script_error", 0, Impl::errorText(p->L, -1));
         lua_pop(p->L, 1);
         p->disabled = true;
     }

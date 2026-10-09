@@ -43,7 +43,7 @@ def source_digest():
     digest = hashlib.sha256()
     for directory in ("src", "include", "assets/shaders", "games"):
         for path in sorted((ROOT / directory).rglob("*")):
-            if path.is_file() and path.suffix in (".cpp", ".hpp", ".sc", ".sh", ".lua"):
+            if path.is_file() and path.suffix in (".cpp", ".mm", ".hpp", ".sc", ".sh", ".lua", ".metal", ".glsl", ".comp", ".vert", ".frag"):
                 digest.update(path.relative_to(ROOT).as_posix().encode())
                 digest.update(path.read_bytes())
     return digest.hexdigest()
@@ -58,6 +58,7 @@ def main():
     parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--quality", choices=("balanced", "low"), default="balanced")
+    parser.add_argument("--renderer", choices=("raster", "path-traced"), default="raster")
     parser.add_argument("--require-local-gate", action="store_true")
     args = parser.parse_args()
     if args.runs < 1 or args.seconds < 1 or args.warmup < 0:
@@ -71,7 +72,8 @@ def main():
         parser.error("output already contains a suite; choose a new directory to retain prior results")
     suite = {"started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
              "hardware": hardware(), "source_sha256": source_digest(), "runs": [],
-             "target_hardware_gate": "Unqualified until three passing runs per scene on both M1 and GTX 1660"}
+             "renderer": args.renderer,
+             "target_hardware_gate": ("Unqualified until three passing runs per scene on 8-core M3 and RTX 3060 12 GB; Windows/Linux runtime checks required" if args.renderer == "path-traced" else "Unqualified until three passing runs per scene on both M1 and GTX 1660")}
     (output / "suite.json").write_text(json.dumps(suite, indent=2) + "\n")
     for scene in args.scenes:
         for run in range(1, args.runs + 1):
@@ -79,7 +81,7 @@ def main():
             csv = output / f"{name}.csv"
             command = [str(player), "--project", str(ROOT / "games" / scene),
                        "--render-benchmark", str(csv), "--width", "1920", "--height", "1080",
-                       "--quality", args.quality, "--benchmark-seconds", str(args.seconds),
+                       "--renderer", args.renderer, "--quality", args.quality, "--benchmark-seconds", str(args.seconds),
                        "--warmup-seconds", str(args.warmup)]
             print(f"{name}: {args.seconds}s after {args.warmup}s warm-up at 1920x1080 {args.quality}", flush=True)
             with (output / f"{name}.log").open("w") as log:

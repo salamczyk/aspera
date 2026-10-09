@@ -9,6 +9,33 @@ on:
         type: boolean
         default: false
 jobs:
+  hardened:
+    name: Sanitizers and untrusted-input fuzzing
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure sanitized engine
+        run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DASPERA_DESKTOP=OFF -DASPERA_SANITIZE=ON
+      - name: Build sanitized engine
+        run: cmake --build build-asan --parallel 3
+      - name: Test under AddressSanitizer and UndefinedBehaviorSanitizer
+        run: ctest --test-dir build-asan --output-on-failure
+      - name: Configure fuzz targets
+        run: cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DASPERA_DESKTOP=OFF -DASPERA_SANITIZE=ON -DASPERA_FUZZ=ON
+      - name: Build fuzz targets
+        run: cmake --build build-fuzz --parallel 3
+      - name: Fuzz the save, .vox and cooked-asset parsers
+        run: ctest --test-dir build-fuzz --output-on-failure -L fuzz
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-findings
+          path: |
+            build-fuzz/crash-*
+            build-fuzz/timeout-*
+            build-fuzz/oom-*
   build:
     strategy:
       fail-fast: false
@@ -19,7 +46,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Linux window-system development packages
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev mesa-vulkan-drivers xvfb
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev mesa-vulkan-drivers libvulkan-dev glslang-tools xvfb
+      - name: Windows Vulkan SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --yes --no-progress
+          $sdk = (Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build

@@ -1,0 +1,69 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+#include "pt_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(std140, set = 0, binding = 0) uniform PtParamsBlock { PtParams params; };
+layout(set = 0, binding = 10, rgba32f) uniform readonly image2D guideImage;
+layout(set = 0, binding = 11, rgba32f) uniform readonly image2D albedoImage;
+layout(set = 0, binding = 13, rgba32f) uniform readonly image2D historyDiffuse;
+layout(set = 0, binding = 14, rgba32f) uniform readonly image2D historySpecular;
+layout(set = 0, binding = 17, rgba32f) uniform readonly image2D moments;
+layout(set = 0, binding = 21, rgba32f) uniform writeonly image2D outputImage;
+layout(set = 0, binding = 22, rgba32f) uniform readonly image2D linearImage;
+
+ivec2 ptPostClamp(ivec2 p, ivec2 size) { return clamp(p, ivec2(0), size - ivec2(1)); }
+
+void main() {
+    uvec2 pixelU = gl_GlobalInvocationID.xy;
+    if (pixelU.x >= params.sizeFrame.x || pixelU.y >= params.sizeFrame.y) return;
+    ivec2 pixel = ivec2(pixelU);
+    ivec2 size = ivec2(params.sizeFrame.xy);
+    uint debug = uint(clamp(params.post.z + 0.5, 0.0, 6.0));
+    if (debug == 1u) {
+        vec3 albedo = clamp(imageLoad(albedoImage, pixel).rgb, vec3(0.0), vec3(1.0));
+        imageStore(outputImage, pixel, vec4(ptLinearToSrgb(albedo), 1.0));
+        return;
+    }
+    if (debug == 2u) {
+        vec3 normal = clamp(imageLoad(guideImage, pixel).xyz * 0.5 + 0.5, vec3(0.0), vec3(1.0));
+        imageStore(outputImage, pixel, vec4(normal, 1.0));
+        return;
+    }
+    if (debug == 5u) {
+        float depth = clamp(imageLoad(guideImage, pixel).w / 64.0, 0.0, 1.0);
+        imageStore(outputImage, pixel, vec4(vec3(depth), 1.0));
+        return;
+    }
+    if (debug == 6u) {
+        float history = clamp(imageLoad(moments, pixel).b / 8.0, 0.0, 1.0);
+        imageStore(outputImage, pixel, vec4(vec3(history), 1.0));
+        return;
+    }
+    vec3 hdr = max(imageLoad(linearImage, pixel).rgb, vec3(0.0));
+    if (debug == 3u || debug == 4u) {
+        hdr = debug == 3u ? max(imageLoad(historyDiffuse, pixel).rgb, vec3(0.0))
+                          : max(imageLoad(historySpecular, pixel).rgb, vec3(0.0));
+        vec3 mapped = ptAces(hdr * max(params.post.x, 0.0));
+        imageStore(outputImage, pixel, vec4(ptLinearToSrgb(mapped), 1.0));
+        return;
+    }
+    vec3 bloom = vec3(0.0);
+    float bloomWeight = 0.0;
+    float bloomStrength = max(params.post.y, 0.0);
+    if (bloomStrength > 0.0) {
+        float threshold = 1.0 / max(params.post.x, 1.0e-5);
+        for (int y = -2; y <= 2; ++y) {
+            for (int x = -2; x <= 2; ++x) {
+                vec3 neighbor = max(imageLoad(linearImage, ptPostClamp(pixel + ivec2(x, y), size)).rgb, vec3(0.0));
+                float weight = 1.0 / (1.0 + float(x * x + y * y));
+                bloom += max(neighbor - vec3(threshold), vec3(0.0)) * weight;
+                bloomWeight += weight;
+            }
+        }
+        bloom /= max(bloomWeight, 1.0e-5);
+    }
+    vec3 mapped = ptAces((hdr + bloom * bloomStrength) * max(params.post.x, 0.0));
+    imageStore(outputImage, pixel, vec4(ptLinearToSrgb(mapped), 1.0));
+}

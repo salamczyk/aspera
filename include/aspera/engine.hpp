@@ -113,6 +113,7 @@ struct Stats {
         structuralCacheBytes{};
     uint32_t structuralNodes{}, bonds{}, activeBodies{}, pendingCommands{};
     uint32_t pendingImpacts{}, droppedImpacts{}, processedImpacts{};
+    uint64_t droppedSimulationSteps{};
     uint64_t collisionChunkRebuilds{}, collisionBodyRebuilds{}, collisionCacheBytes{};
     uint32_t collisionBodyCount{}, queuedCollisionChunks{};
     double collisionPreparationMs{};
@@ -127,6 +128,36 @@ std::vector<uint8_t> encodeWorld(const World &);
 World decodeWorld(const std::vector<uint8_t> &);
 void saveWorld(const World &, const std::filesystem::path &);
 World loadWorld(const std::filesystem::path &);
+
+using PlayerId = uint32_t;
+struct PlayerSpawn {
+    Vec3 position{};
+    float yaw{}, pitch{};
+};
+struct PlayerSettings {
+    bool enabled{};
+    std::vector<PlayerSpawn> spawns;
+    Vec3 minimum{-100, -30, -100}, maximum{100, 100, 100};
+    MaterialId buildMaterial{5};
+};
+struct PlayerInput {
+    uint64_t sequence{};
+    uint32_t generation{};
+    float moveX{}, moveZ{}, yaw{}, pitch{};
+    bool jump{}, damage{}, build{}, recover{};
+};
+struct PlayerState {
+    PlayerId id{};
+    Vec3 position{}, velocity{};
+    float yaw{}, pitch{};
+    bool grounded{}, spawnBlocked{};
+    EntityId support{};
+    uint64_t acknowledgedInput{}, collisionRevision{};
+    uint32_t generation{1};
+};
+// Content fingerprint of collision geometry, excluding moving-body poses.
+uint64_t playerCollisionRevision(const World &);
+bool validPlayerInput(const PlayerInput &);
 
 class Engine {
   public:
@@ -153,6 +184,17 @@ class Engine {
     void emit(std::string type, EntityId entity = 0, std::string message = {},
               uint64_t command = 0);
     std::string projectName() const;
+    const PlayerSettings &playerSettings() const;
+    const std::map<PlayerId, PlayerState> &players() const;
+    void addPlayer(PlayerId);
+    void removePlayer(PlayerId);
+    bool submitPlayerInput(PlayerId, PlayerInput);
+    void setPlayerStates(std::map<PlayerId, PlayerState>);
+    void resetPlayers();
+    void predictPlayer(PlayerId, PlayerInput, float dt = 1.f / 60.f);
+    std::optional<PlayerState> predictedPlayer() const;
+    size_t predictionHistorySize() const;
+    void clearPrediction();
     void setInput(std::string action, float value);
     void setEnvironment(const EnvironmentSettings &);
     void setMaterial(MaterialId, const Material &);
@@ -173,6 +215,10 @@ class Network {
     void connect(const std::string &address, uint16_t port = 24680);
     void poll(Engine &);
     void sendCommand(Command);
+    PlayerId localPlayer() const;
+    std::map<PlayerId, PlayerState> presentedPlayers() const;
+    void sendPlayerInput(PlayerInput);
+    void resetRound(Engine &);
     void broadcast(Engine &);
     bool isClient() const;
     bool connected() const;
@@ -193,6 +239,8 @@ struct AppOptions {
     int frameLimit{};
     std::filesystem::path screenshot;
     bool lowQuality{}, noBloom{}, noUi{}, fixedStep{}, renderSmoke{};
+    bool pathTracing{}, ptNoDenoise{};
+    int ptSamples{1}, ptBounces{6}, ptCaptureSamples{};
     int width{1440}, height{900};
     bool explicitSize{};
     int debugView{};

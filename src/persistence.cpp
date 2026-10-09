@@ -98,6 +98,44 @@ bool validMaterial(const Material &m) {
            m.roughness >= 0 && m.roughness <= 1 && m.metallic >= 0 && m.metallic <= 1 &&
            m.emissive.x >= 0 && m.emissive.y >= 0 && m.emissive.z >= 0 && m.emissionIntensity >= 0;
 }
+bool validTransform(const Transform &t) {
+    if (!finite(t.position) || !std::isfinite(t.rotation.x) || !std::isfinite(t.rotation.y) ||
+        !std::isfinite(t.rotation.z) || !std::isfinite(t.rotation.w))
+        return false;
+    const auto &q = t.rotation;
+    return std::abs(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w - 1) <= 0.01f;
+}
+// decodeWorld enforces these ceilings; a writer that ignores them produces files
+// and snapshots its own reader rejects, which reads as silent data loss.
+void checkReadable(const World &world) {
+    if (world.materials.size() < 2 || world.materials.size() > 4096)
+        throw std::runtime_error("World material count is not loadable");
+    if (world.objects.size() > 4096)
+        throw std::runtime_error("World object count is not loadable");
+    if (world.joints.size() > 8192)
+        throw std::runtime_error("World joint count is not loadable");
+    if (world.properties.size() > 4096)
+        throw std::runtime_error("World property count is not loadable");
+    if (world.voxelSize < .01f || world.voxelSize > 10)
+        throw std::runtime_error("World voxel size is not loadable");
+    size_t voxels = 0;
+    for (const auto &[id, o] : world.objects) {
+        if (!id || id >= world.nextEntity)
+            throw std::runtime_error("Object identifier is not loadable");
+        if (!validTransform(o.transform))
+            throw std::runtime_error("Object transform is not loadable");
+        if (!finite(o.velocity) || !finite(o.angularVelocity) || !std::isfinite(o.stress))
+            throw std::runtime_error("Object motion is not loadable");
+        voxels += o.grid.count();
+        if (voxels > MaxVoxels)
+            throw std::runtime_error("World exceeds the loadable voxel budget");
+        if (o.anchors.size() > o.grid.count() || o.damage.size() > o.grid.count())
+            throw std::runtime_error("Object anchor/damage count is not loadable");
+        for (const auto &[cell, amount] : o.damage)
+            if (!(amount >= 0) || !std::isfinite(amount))
+                throw std::runtime_error("Object damage is not loadable");
+    }
+}
 bool validEnvironment(const EnvironmentSettings &v) {
     return finite(v.sunDirection) && length(v.sunDirection) > .0001f && finite(v.sunColor) &&
            finite(v.skyColor) && std::isfinite(v.sunIntensity) && std::isfinite(v.skyIntensity) &&
@@ -119,6 +157,8 @@ bool validLight(const Light &v) {
 EntityId World::spawn(std::string name, VoxelGrid grid, Transform transform, bool dynamic) {
     if (objects.size() >= 4096)
         throw std::runtime_error("Object budget exceeded");
+    if (!nextEntity || nextEntity == std::numeric_limits<EntityId>::max())
+        throw std::runtime_error("Entity identifier space exhausted");
     auto id = nextEntity++;
     Object o;
     o.id = id;
@@ -126,7 +166,8 @@ EntityId World::spawn(std::string name, VoxelGrid grid, Transform transform, boo
     o.grid = std::move(grid);
     o.transform = transform;
     o.dynamic = dynamic;
-    objects.emplace(id, std::move(o));
+    if (!objects.emplace(id, std::move(o)).second)
+        throw std::runtime_error("Entity identifier already exists");
     ++revision;
     return id;
 }
@@ -139,6 +180,7 @@ uint64_t World::checksum() const {
     return h;
 }
 std::vector<uint8_t> encodeWorld(const World &world) {
+    checkReadable(world);
     Writer w;
     w.put<uint32_t>(0x41535057);
     w.put<uint32_t>(3);
@@ -254,6 +296,8 @@ World decodeWorld(const std::vector<uint8_t> &bytes) {
     w.tick = r.get<uint64_t>();
     w.revision = r.get<uint64_t>();
     w.nextEntity = r.get<uint64_t>();
+    if (!w.nextEntity || w.nextEntity == std::numeric_limits<EntityId>::max())
+        throw std::runtime_error("Invalid entity allocator");
     auto nm = r.count(4096);
     if (nm < 2)
         throw std::runtime_error("Missing materials");
@@ -319,13 +363,13 @@ World decodeWorld(const std::vector<uint8_t> &bytes) {
             if (!o.grid.get(p) || !o.anchors.insert(p).second)
                 throw std::runtime_error("Invalid anchor");
         }
-        auto ns = r.count(MaxVoxels * 3);
+        auto ns = r.count(n * 3);
         for (uint32_t j = 0; j < ns; ++j) {
             auto a = r.ivec(), b = r.ivec();
             auto d = b - a;
-            if (!(a < b) || std::abs(d.x) + std::abs(d.y) + std::abs(d.z) != 1)
+            if (!(a < b) || std::abs(d.x) + std::abs(d.y) + std::abs(d.z) != 1 || !o.grid.get(a) ||
+                !o.grid.get(b) || !o.seams.insert({a, b}).second)
                 throw std::runtime_error("Invalid seam");
-            o.seams.insert({a, b});
         }
         auto nd = r.count(n);
         for (uint32_t j = 0; j < nd; ++j) {

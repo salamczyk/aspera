@@ -5,17 +5,32 @@ Both desktop programs accept `--project <path>`, `--host`, `--connect <host>`,
 
 ## Player
 
-`W`, `A`, `S`, and `D` move the camera. Hold `Middle mouse` and move the mouse to
-look around. Use `Tab` to change between first-person and top-down views.
-`Left mouse` damages the voxel surface under the mouse pointer; `Right mouse`
-places a timber prefab there. The pointer stays free in both views.
+Player-enabled projects use a grounded first-person controller. `W`, `A`, `S`,
+and `D` move relative to the view; `Space` jumps on the first press while
+grounded. Move the mouse to look around after capture. `Escape` releases mouse
+capture for the HUD, and clicking the viewport captures it again. `R` requests
+individual recovery to the next clear authored spawn; leaving the project bounds
+also requests recovery.
 
-The Demolition project asks the player to collapse the old river works while
-keeping the amber survey core intact. Construction Defense is top-down by
+In a player session, `Left mouse` sends an authoritative damage intent from the
+center-screen ray and `Right mouse` sends a construction intent using the
+project's `player.build_material`. Both tools have a four-metre reach. The
+authority checks the ray, support, and placement clearance before queuing the
+existing voxel transaction. Focus loss clears movement and one-shot actions.
+
+The editor and explicit `--camera` captures use the inspection camera.
+Projects without a `player` manifest section retain the free-flight inspection
+camera: `W`, `A`, `S`, and `D` move it, `Middle mouse` looks around, and `Tab`
+changes between first-person and top-down views. The pointer stays free in that
+mode.
+
+The Quarry Demolition project asks up to four players to remove at least 68% of
+the timber/steel works while keeping at least 80% of the amber survey core. Its
+HUD reads the replicated `game.state` (`0` active, `1` victory, `2` failed),
+`game.progress`, and `demolition.core_integrity`. Construction material 5 is
+excluded from the works denominator. Construction Defense remains top-down by
 default: build a protective shell around the command core and survive incoming
-scripted impacts for 90 seconds. HUD state is stored in the replicated world
-properties: `game.state` is active/victory/failed as `0/1/2`, and
-`game.progress` ranges from zero to one.
+scripted impacts for 90 seconds.
 
 ## Editor
 
@@ -49,8 +64,10 @@ Use the **Asset Import** field to add a cooked `.avox` collection or a source
 
 Hard collisions chip both objects according to material **Impact kJ/m3** toughness
 and can sever supports into moving fragments. Gentle contacts below 1 m/s do not
-apply impact damage. Impacts are authoritative on the host; use matching protocol-3
-builds for co-op.
+apply impact damage. Impacts and player movement are authoritative on the host;
+use matching protocol-4 builds for co-op. The player prediction path treats
+published moving fragments as approximate obstacles, so a correction is expected
+when a newly fractured fragment changes the collision revision.
 
 During Play, select an object and choose **Release / Drop** to remove its anchors
 and let it fall at its current position. **Launch** assigns velocity along the

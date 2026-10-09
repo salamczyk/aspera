@@ -50,6 +50,17 @@ int main() {
                 throw std::runtime_error(std::string("Incorrect graphics qualification: ") +
                                          test.name);
         }
+        for(int mode=0;mode<4;mode++){
+            AppOptions options;options.pathTracing=true;options.renderBenchmark=directory/("pt-"+std::to_string(mode)+".csv");
+            RenderBenchmark benchmark(options,1920,1080);
+            for(uint32_t frame=0;frame<=1800;frame++){
+                RenderTimings s;s.backend=mode==1?"raster":"path-traced (Metal)";s.gpuFrame=frame;s.gpuMs=25;s.traceMs=20;s.denoiseMs=mode==2?0:5;
+                benchmark.record(double(frame)/30,mode==3?40:30,1,s);
+            }
+            benchmark.write();auto path=options.renderBenchmark;path.replace_extension("json");std::ifstream f(path);std::string text((std::istreambuf_iterator<char>(f)),{});
+            const bool passed=text.find("\"local_frame_gate_passed\": true")!=std::string::npos;
+            if(passed!=(mode==0))throw std::runtime_error("Incorrect path-tracing graphics qualification");
+        }
         std::filesystem::remove_all(directory);
         std::cout << "Graphics qualification regression checks passed\n";
         return 0;

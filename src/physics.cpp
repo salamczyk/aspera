@@ -6,9 +6,14 @@
 #include <Jolt/Core/JobSystemThreadPool.h>
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Character/CharacterVirtual.h>
+#include <Jolt/Physics/Collision/CollideShape.h>
+#include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/EstimateCollisionResponse.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Constraints/FixedConstraint.h>
 #include <Jolt/Physics/Constraints/HingeConstraint.h>
@@ -52,7 +57,7 @@ struct BroadPhase : JPH::BroadPhaseLayerInterface {
         return 2;
     }
     JPH::BroadPhaseLayer GetBroadPhaseLayer(JPH::ObjectLayer l) const override {
-        return JPH::BroadPhaseLayer(uint8_t(l));
+        return JPH::BroadPhaseLayer(l == 0 ? 0 : 1);
     }
 #if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
     const char *GetBroadPhaseLayerName(JPH::BroadPhaseLayer l) const override {
@@ -67,11 +72,35 @@ struct LayerFilter : JPH::ObjectVsBroadPhaseLayerFilter {
 };
 struct PairFilter : JPH::ObjectLayerPairFilter {
     bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override {
-        return a != 0 || b != 0;
+        return !(a == 2 && b == 2) && (a != 0 || b != 0);
+    }
+};
+struct CharacterLayerFilter : JPH::ObjectLayerFilter {
+    bool ShouldCollide(JPH::ObjectLayer layer) const override {
+        return layer != 2;
     }
 };
 } // namespace
 struct Physics::Impl : JPH::ContactListener {
+    CharacterLayerFilter characterLayers;
+    bool prediction{};
+    uint64_t publishedRevision{};
+    std::map<PlayerId, JPH::Ref<JPH::CharacterVirtual>> characters;
+    JPH::Ref<JPH::CharacterVirtual> makeCharacter(Vec3 position) {
+        JPH::CharacterVirtualSettings settings;
+        settings.mShape = new JPH::RotatedTranslatedShape(
+            JPH::Vec3(0, .9f, 0), JPH::Quat::sIdentity(), new JPH::CapsuleShape(.6f, .3f));
+        if (!prediction) {
+            settings.mInnerBodyShape = new JPH::RotatedTranslatedShape(
+                JPH::Vec3(0, .9f, 0), JPH::Quat::sIdentity(), new JPH::CapsuleShape(.6f, .28f));
+            settings.mInnerBodyLayer = 2;
+        }
+        settings.mMaxSlopeAngle = JPH::DegreesToRadians(45);
+        settings.mMaxStrength = prediction ? 0.f : 100.f;
+        settings.mSupportingVolume = JPH::Plane(JPH::Vec3::sAxisY(), -.3f);
+        return new JPH::CharacterVirtual(&settings, JPH::RVec3(position.x, position.y, position.z),
+                                         JPH::Quat::sIdentity(), 0, &system);
+    }
     BroadPhase broad;
     LayerFilter layer;
     PairFilter pair;
@@ -116,6 +145,9 @@ struct Physics::Impl : JPH::ContactListener {
     }
     void contact(const JPH::Body &a, const JPH::Body &b, const JPH::ContactManifold &m,
                  const JPH::ContactSettings &settings) {
+        // Character proxy bodies participate in physical collision but never in voxel damage.
+        if (!a.GetUserData() || !b.GetUserData())
+            return;
         if (m.mRelativeContactPointsOn1.empty())
             return;
         auto normal = m.mWorldSpaceNormal;
@@ -265,6 +297,8 @@ Physics::~Physics() {
     clear();
 }
 void Physics::clear() {
+    p->characters.clear();
+    p->publishedRevision = 0;
     for (auto &[id, j] : p->joints)
         p->system.RemoveConstraint(j);
     p->joints.clear();
@@ -486,7 +520,9 @@ void Physics::sync(World &w) {
                     JPH::RVec3(object.transform.position.x, object.transform.position.y,
                                object.transform.position.z),
                     JPH::Quat(q.x, q.y, q.z, q.w),
-                    object.dynamic ? JPH::EMotionType::Dynamic : JPH::EMotionType::Static,
+                    object.dynamic
+                        ? (p->prediction ? JPH::EMotionType::Kinematic : JPH::EMotionType::Dynamic)
+                        : JPH::EMotionType::Static,
                     object.dynamic ? 1 : 0);
                 settings.mUserData = id;
                 settings.mFriction = .7f;
@@ -596,6 +632,23 @@ void Physics::sync(World &w) {
         p->collisionBodyCount += uint32_t(record.parts.size());
     p->updateCacheBytes();
 
+    for (const auto &[id, record] : p->bodies) {
+        const auto &object = w.objects.at(id);
+        for (const auto &part : record.parts) {
+            auto q = object.transform.rotation;
+            if (!object.dynamic || p->prediction)
+                bi.SetPositionAndRotation(
+                    part.id,
+                    JPH::RVec3(object.transform.position.x, object.transform.position.y,
+                               object.transform.position.z),
+                    JPH::Quat(q.x, q.y, q.z, q.w), JPH::EActivation::DontActivate);
+            if (object.dynamic && p->prediction) {
+                bi.SetLinearVelocity(part.id, jv(object.velocity));
+                bi.SetAngularVelocity(part.id, jv(object.angularVelocity));
+            }
+        }
+    }
+    p->publishedRevision = playerCollisionRevision(w);
     std::set<uint64_t> keep;
     auto bodyFor = [&](EntityId id, Vec3 anchor) -> std::optional<JPH::BodyID> {
         auto record = p->bodies.find(id);
@@ -629,6 +682,8 @@ void Physics::sync(World &w) {
         return selected.IsInvalid() ? std::nullopt : std::optional<JPH::BodyID>(selected);
     };
     for (auto &j : w.joints) {
+        if (p->prediction)
+            continue;
         keep.insert(j.id);
         if (p->joints.contains(j.id) || !p->bodies.contains(j.a) || !p->bodies.contains(j.b))
             continue;
@@ -674,13 +729,81 @@ void Physics::sync(World &w) {
     collisionPreparationMs = p->collisionPreparationMs;
     queuedCollisionChunks = p->queuedCollisionChunks;
 }
+void Physics::setPrediction(bool enabled) {
+    p->prediction = enabled;
+}
+uint64_t Physics::collisionRevision() const {
+    return p->publishedRevision;
+}
+void Physics::forgetPlayer(PlayerId id) {
+    p->characters.erase(id);
+}
+bool Physics::playerClear(Vec3 position) {
+    auto character = p->makeCharacter(position);
+    JPH::AllHitCollisionCollector<JPH::CollideShapeCollector> collector;
+    character->CheckCollision(
+        JPH::RVec3(position.x, position.y, position.z), JPH::Quat::sIdentity(), JPH::Vec3::sZero(),
+        0, character->GetShape(), JPH::RVec3(position.x, position.y, position.z), collector,
+        p->system.GetDefaultBroadPhaseLayerFilter(1), p->characterLayers, {}, {});
+    for (const auto &hit : collector.mHits)
+        if (hit.mPenetrationDepth > .005f)
+            return false;
+    return true;
+}
+void Physics::restorePlayer(const PlayerState &state) {
+    p->characters.erase(state.id);
+    auto character = p->makeCharacter(state.position);
+    character->SetLinearVelocity(jv(state.velocity));
+    character->RefreshContacts(p->system.GetDefaultBroadPhaseLayerFilter(1), p->characterLayers, {},
+                               {}, p->temp);
+    p->characters[state.id] = std::move(character);
+}
+void Physics::movePlayer(PlayerState &state, const PlayerInput &input, float dt) {
+    if (!p->characters.contains(state.id))
+        restorePlayer(state);
+    auto character = p->characters.at(state.id);
+    state.yaw = input.yaw;
+    state.pitch = input.pitch;
+    character->RefreshContacts(p->system.GetDefaultBroadPhaseLayerFilter(1), p->characterLayers, {},
+                               {}, p->temp);
+    character->UpdateGroundVelocity();
+    Vec3 forward{std::sin(state.yaw), 0, std::cos(state.yaw)},
+        right{std::cos(state.yaw), 0, -std::sin(state.yaw)};
+    Vec3 horizontal = (right * input.moveX + forward * input.moveZ) * 4.f;
+    auto current = character->GetLinearVelocity();
+    auto ground = character->GetGroundVelocity();
+    bool grounded = character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround;
+    JPH::Vec3 velocity(horizontal.x, current.GetY(), horizontal.z);
+    if (grounded && current.GetY() - ground.GetY() < .1f) {
+        velocity = ground + jv(horizontal);
+        if (input.jump)
+            velocity += JPH::Vec3(0, 5, 0);
+    }
+    velocity += JPH::Vec3(0, -9.81f * dt, 0);
+    character->SetLinearVelocity(velocity);
+    JPH::CharacterVirtual::ExtendedUpdateSettings settings;
+    settings.mWalkStairsStepUp = JPH::Vec3(0, .3f, 0);
+    settings.mStickToFloorStepDown = JPH::Vec3(0, -.3f, 0);
+    if (input.jump)
+        settings.mStickToFloorStepDown = JPH::Vec3::sZero();
+    character->ExtendedUpdate(dt, JPH::Vec3(0, -9.81f, 0), settings,
+                              p->system.GetDefaultBroadPhaseLayerFilter(1), p->characterLayers, {},
+                              {}, p->temp);
+    state.position = av(JPH::Vec3(character->GetPosition()));
+    state.velocity = av(character->GetLinearVelocity());
+    state.grounded = character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround;
+    auto body = character->GetGroundBodyID();
+    state.support = body.IsInvalid() ? 0 : p->system.GetBodyInterface().GetUserData(body);
+    state.collisionRevision = p->publishedRevision;
+}
 void Physics::step(World &w, float dt) {
     p->dt = dt;
     ++p->tick;
     p->impacts.clear();
     p->dropped = 0;
     p->forces.clear();
-    p->system.Update(dt, 1, &p->temp, &p->jobs);
+    if (p->system.Update(dt, 1, &p->temp, &p->jobs) != JPH::EPhysicsUpdateError::None)
+        ++droppedSimulationSteps;
     forces = std::move(p->forces);
     impacts.clear();
     for (auto &[key, hit] : p->impacts) {
@@ -724,10 +847,12 @@ void Physics::step(World &w, float dt) {
         return true;
     });
 }
-void Physics::impulse(EntityId id, Vec3 impulse, Vec3 point) {
+bool Physics::impulse(EntityId id, Vec3 impulse, Vec3 point) {
     auto it = p->bodies.find(id);
-    if (it != p->bodies.end() && it->second.dynamic && !it->second.parts.empty())
-        p->system.GetBodyInterface().AddImpulse(it->second.parts.front().id, jv(impulse),
-                                                JPH::RVec3(point.x, point.y, point.z));
+    if (it == p->bodies.end() || !it->second.dynamic || it->second.parts.empty())
+        return false;
+    p->system.GetBodyInterface().AddImpulse(it->second.parts.front().id, jv(impulse),
+                                            JPH::RVec3(point.x, point.y, point.z));
+    return true;
 }
 } // namespace aspera

@@ -18,11 +18,21 @@ class Physics {
     void seedCollisionCache(EntityId, const VoxelGrid &, float,
                             const std::map<IVec3, std::vector<CollisionBox>> &);
     void sync(World &);
+    void setPrediction(bool);
+    uint64_t collisionRevision() const;
+    void movePlayer(PlayerState &, const PlayerInput &, float dt);
+    bool playerClear(Vec3);
+    void forgetPlayer(PlayerId);
+    void restorePlayer(const PlayerState &);
     void step(World &, float);
-    void impulse(EntityId, Vec3, Vec3);
+    // False when the entity has no simulated dynamic body, so callers do not
+    // report a silently dropped impulse as committed.
+    bool impulse(EntityId, Vec3, Vec3);
     std::map<EntityId, std::map<IVec3, Vec3>> forces;
     std::vector<Impact> impacts;
     uint32_t droppedImpacts{};
+    // Jolt reported a clipped body/contact/step budget during Update().
+    uint64_t droppedSimulationSteps{};
     // Collision preparation diagnostics. These are cumulative for the current
     // physics lifetime except for the current cache/body counts and timing.
     uint64_t collisionChunkRebuilds{};
@@ -120,12 +130,35 @@ class Scripts {
     void load(Engine &, const std::filesystem::path &, bool initialize);
     void tick(Engine &, float);
     void input(const std::string &, float);
+    PlayerSettings playerSettings;
     std::string name;
     std::filesystem::path project;
 
   private:
     struct Impl;
     std::unique_ptr<Impl> p;
+};
+class PlayerSession {
+  public:
+    std::map<PlayerId, PlayerState> states;
+    struct InputQueue {
+        std::deque<PlayerInput> frames;
+        PlayerInput last{};
+        uint64_t received{};
+        float silence{};
+    };
+    std::map<PlayerId, InputQueue> inputs;
+    std::set<PlayerId> recovering;
+    std::unique_ptr<Physics> prediction;
+    std::optional<PlayerState> predicted;
+    std::deque<PlayerInput> history;
+    uint64_t reconciled{};
+    void tick(Engine &, Physics &, float);
+    bool submit(PlayerId, PlayerInput);
+    void recover(PlayerId);
+    void reset();
+    void predict(Engine &, PlayerId, PlayerInput, float);
+    void clearPrediction();
 };
 inline Seam seam(IVec3 a, IVec3 b) {
     return a < b ? Seam{a, b} : Seam{b, a};

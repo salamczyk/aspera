@@ -3,6 +3,7 @@
 
 #include <charconv>
 #include <cstdio>
+#include <stdexcept>
 #include <string_view>
 
 int main(int argc, char **argv) {
@@ -21,12 +22,12 @@ int main(int argc, char **argv) {
                 options.host = true;
             else if (arg == "--connect")
                 options.connectAddress = value();
-            else if (arg == "--port") {
-                const auto text = value();
-                std::from_chars(text.data(), text.data() + text.size(), options.port);
-            } else if (arg == "--frames") {
-                const auto text = value();
-                std::from_chars(text.data(), text.data() + text.size(), options.frameLimit);
+            else if (arg == "--port")
+                aspera::parseInteger(options.port, arg, i, argc, argv);
+            else if (arg == "--frames") {
+                aspera::parseInteger(options.frameLimit, arg, i, argc, argv);
+                if (options.frameLimit < 1)
+                    throw std::runtime_error("--frames must be at least 1");
             } else if (arg == "--screenshot")
                 options.screenshot = value();
             else if (arg == "--help") {

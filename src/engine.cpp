@@ -8,6 +8,34 @@
 
 namespace aspera {
 namespace {
+bool addedVoxelsBlockPlayer(const Object &before, const Object &after, float size,
+                            const std::map<PlayerId, PlayerState> &players) {
+    auto q = before.transform.rotation;
+    for (const auto &[id, player] : players) {
+        (void)id;
+        if (player.spawnBlocked)
+            continue;
+        Vec3 minimum{1e9f, 1e9f, 1e9f}, maximum{-1e9f, -1e9f, -1e9f};
+        for (float x : {-.32f, .32f})
+            for (float y : {0.f, 1.82f})
+                for (float z : {-.32f, .32f}) {
+                    auto local = rotate({-q.x, -q.y, -q.z, q.w}, player.position + Vec3{x, y, z} -
+                                                                     before.transform.position);
+                    minimum = {std::min(minimum.x, local.x), std::min(minimum.y, local.y),
+                               std::min(minimum.z, local.z)};
+                    maximum = {std::max(maximum.x, local.x), std::max(maximum.y, local.y),
+                               std::max(maximum.z, local.z)};
+                }
+        for (int x = int(std::floor(minimum.x / size)); x <= int(std::floor(maximum.x / size)); ++x)
+            for (int y = int(std::floor(minimum.y / size)); y <= int(std::floor(maximum.y / size));
+                 ++y)
+                for (int z = int(std::floor(minimum.z / size));
+                     z <= int(std::floor(maximum.z / size)); ++z)
+                    if (after.grid.get({x, y, z}) && !before.grid.get({x, y, z}))
+                        return true;
+    }
+    return false;
+}
 struct CollisionPreparation {
     std::map<IVec3, uint64_t> keys;
     std::map<IVec3, std::vector<CollisionBox>> boxes;
@@ -270,6 +298,7 @@ EntityId publishLandscapeData(World &world, LandscapeData data) {
 } // namespace
 struct Engine::Impl {
     Physics physics;
+    PlayerSession players;
     Structure structure;
     Scripts scripts;
     std::deque<Command> queue;
@@ -321,8 +350,8 @@ Engine::Engine() : impl_(std::make_unique<Impl>()) {
 }
 Engine::~Engine() = default;
 void Engine::emit(std::string type, EntityId entity, std::string message, uint64_t command) {
-    events.push_back(
-        {command, world.tick, std::move(type), std::move(message), entity, impl_->nextEvent++});
+    events.push_back({command, world.tick, std::move(type), std::move(message), entity,
+                      impl_->nextEvent++, std::nullopt});
     while (events.size() > 256)
         events.pop_front();
 }
@@ -382,6 +411,10 @@ void Engine::step(float dt) {
             emit("rejected", it->entity, prepared.error, prepared.command.id);
         else if (found == world.objects.end() || found->second.revision != it->revision)
             emit("rejected", it->entity, "Stale prepared revision", prepared.command.id);
+        else if (prepared.command.type == CommandType::SpawnPrefab &&
+                 addedVoxelsBlockPlayer(found->second, prepared.object, world.voxelSize,
+                                        impl_->players.states))
+            emit("rejected", it->entity, "Player blocks construction", prepared.command.id);
         else {
             // Preserve motion that advanced while voxel work ran off-thread.
             prepared.object.transform = found->second.transform;
@@ -411,14 +444,18 @@ void Engine::step(float dt) {
             continue;
         }
         if (c.type == CommandType::SpawnPrefab && !c.entity) {
-            VoxelGrid grid;
-            int n = std::clamp(int(c.radius / world.voxelSize), 1, 16);
-            for (int x = 0; x < n; ++x)
-                for (int y = 0; y < n; ++y)
-                    for (int z = 0; z < n; ++z)
-                        grid.set({x, y, z}, std::max<MaterialId>(1, c.material));
-            auto id = world.spawn("Block", std::move(grid), {c.point, {}}, true);
-            emit("committed", id, "Prefab spawned", c.id);
+            try {
+                VoxelGrid grid;
+                int n = std::clamp(int(c.radius / world.voxelSize), 1, 16);
+                for (int x = 0; x < n; ++x)
+                    for (int y = 0; y < n; ++y)
+                        for (int z = 0; z < n; ++z)
+                            grid.set({x, y, z}, std::max<MaterialId>(1, c.material));
+                auto id = world.spawn("Block", std::move(grid), {c.point, {}}, true);
+                emit("committed", id, "Prefab spawned", c.id);
+            } catch (const std::exception &ex) {
+                emit("rejected", 0, ex.what(), c.id);
+            }
             continue;
         }
         auto found = world.objects.find(c.entity);
@@ -448,9 +485,19 @@ void Engine::step(float dt) {
             continue;
         }
         if (c.type == CommandType::Impulse) {
-            impl_->physics.sync(world);
-            impl_->physics.impulse(c.entity, c.vector, c.point);
-            emit("committed", c.entity, "Impulse applied", c.id);
+            if (c.expectedRevision && c.expectedRevision != found->second.revision) {
+                emit("rejected", c.entity, "Stale object revision", c.id);
+                continue;
+            }
+            try {
+                impl_->physics.sync(world);
+                if (impl_->physics.impulse(c.entity, c.vector, c.point))
+                    emit("committed", c.entity, "Impulse applied", c.id);
+                else
+                    emit("rejected", c.entity, "Impulse requires a simulated dynamic body", c.id);
+            } catch (const std::exception &ex) {
+                emit("budget", c.entity, ex.what(), c.id);
+            }
             continue;
         }
         auto copy = found->second;
@@ -516,9 +563,14 @@ void Engine::step(float dt) {
         emit("budget", 0, ex.what());
     }
     auto physicsStart = std::chrono::steady_clock::now();
-    impl_->physics.sync(world);
+    try {
+        impl_->physics.sync(world);
+    } catch (const std::exception &ex) {
+        emit("budget", 0, ex.what());
+    }
     std::erase_if(impl_->collisionPreparations,
                   [&](auto &entry) { return !world.objects.contains(entry.first); });
+    impl_->players.tick(*this, impl_->physics, dt);
     impl_->physics.step(world, dt);
     stats.droppedImpacts += impl_->physics.droppedImpacts;
     for (auto &hit : impl_->physics.impacts) {
@@ -536,6 +588,7 @@ void Engine::step(float dt) {
     stats.physicsMs =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - physicsStart)
             .count();
+    stats.droppedSimulationSteps = impl_->physics.droppedSimulationSteps;
     stats.collisionChunkRebuilds = impl_->physics.collisionChunkRebuilds;
     stats.collisionBodyRebuilds = impl_->physics.collisionBodyRebuilds;
     stats.collisionCacheBytes = impl_->physics.collisionCacheBytes;
@@ -556,7 +609,6 @@ void Engine::validateLandscape(const LandscapeData &data) const {
     validateLandscapeData(data, world);
 }
 EntityId Engine::publishLandscape(LandscapeData data) {
-    landscapeWorldBudget(world, data);
     auto [collisions, structure] = validateLandscapeData(data, world);
     auto id = publishLandscapeData(world, std::move(data));
     impl_->structure.seed(id, std::move(structure));
@@ -603,6 +655,7 @@ void Engine::resetPhysics() {
     if (impl_->landscape) {
         emit("rejected", 0, "Landscape generation cancelled: world reset",
              impl_->landscape->command);
+        impl_->retiredLandscapes.push_back(std::move(impl_->landscape->result));
         impl_->landscape.reset();
     }
     impl_->jobs.clear();
@@ -610,11 +663,15 @@ void Engine::resetPhysics() {
     impl_->queue.clear();
     impl_->impacts.clear();
     stats.pendingImpacts = stats.droppedImpacts = stats.processedImpacts = 0;
+    impl_->players.reset();
     impl_->physics.clear();
     impl_->structure.clear();
 }
 void Engine::loadProject(const std::filesystem::path &path) {
     resetPhysics();
+    impl_->players.states.clear();
+    impl_->players.inputs.clear();
+    impl_->players.recovering.clear();
     world.objects.clear();
     world.joints.clear();
     world.properties.clear();
@@ -655,6 +712,64 @@ void Engine::reloadScripts() {
 std::string Engine::projectName() const {
     return impl_->scripts.name;
 }
+const PlayerSettings &Engine::playerSettings() const {
+    return impl_->scripts.playerSettings;
+}
+const std::map<PlayerId, PlayerState> &Engine::players() const {
+    return impl_->players.states;
+}
+void Engine::addPlayer(PlayerId id) {
+    if (!id || !playerSettings().enabled || impl_->players.states.contains(id))
+        return;
+    if (impl_->players.states.size() >= 4)
+        throw std::runtime_error("Player limit exceeded");
+    PlayerState state;
+    state.id = id;
+    const auto &spawn = playerSettings().spawns.at((id - 1) % playerSettings().spawns.size());
+    state.position = spawn.position;
+    state.yaw = spawn.yaw;
+    state.pitch = spawn.pitch;
+    state.spawnBlocked = true;
+    impl_->players.states.emplace(id, state);
+    impl_->players.recovering.insert(id);
+}
+void Engine::removePlayer(PlayerId id) {
+    impl_->physics.forgetPlayer(id);
+    impl_->players.states.erase(id);
+    impl_->players.inputs.erase(id);
+    impl_->players.recovering.erase(id);
+}
+bool Engine::submitPlayerInput(PlayerId id, PlayerInput input) {
+    return impl_->players.submit(id, input);
+}
+void Engine::setPlayerStates(std::map<PlayerId, PlayerState> states) {
+    if (states.size() > 4)
+        throw std::runtime_error("Invalid player roster");
+    for (const auto &[id, state] : states)
+        if (!id || id != state.id || !state.generation || !finite(state.position) ||
+            !finite(state.velocity) || length(state.position) > 100000.f ||
+            length(state.velocity) > 1000.f || !std::isfinite(state.yaw) ||
+            std::abs(state.yaw) > 10000.f || !std::isfinite(state.pitch) ||
+            std::abs(state.pitch) > 1.45f)
+            throw std::runtime_error("Invalid player state");
+    impl_->players.states = std::move(states);
+}
+void Engine::resetPlayers() {
+    impl_->players.reset();
+}
+void Engine::predictPlayer(PlayerId id, PlayerInput input, float dt) {
+    impl_->players.predict(*this, id, input, dt);
+}
+std::optional<PlayerState> Engine::predictedPlayer() const {
+    return impl_->players.predicted;
+}
+size_t Engine::predictionHistorySize() const {
+    return impl_->players.history.size();
+}
+void Engine::clearPrediction() {
+    impl_->players.clearPrediction();
+}
+
 void Engine::setInput(std::string action, float value) {
     impl_->scripts.input(action, value);
 }
@@ -681,6 +796,7 @@ void Engine::setMaterial(MaterialId id, const Material &material) {
         // can run against the new material state.  resetPhysics() would silently discard both.
         impl_->impacts.clear();
         stats.pendingImpacts = 0;
+        impl_->players.reset();
         impl_->physics.clear();
         impl_->structure.materialsChanged(world);
     }

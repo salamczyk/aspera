@@ -22,15 +22,16 @@ This file separates implemented behavior from the full release design. Passing t
 - Finite seeded voxel landscapes with caves, overhangs, material layers, foundation anchors, Lua/editor authoring, and a quarry demo.
 - Independent chunk mesh/collision/GI caches, bounded background mesh/edit preparation, static chunk bodies, dynamic compound fragments, and a byte-bounded undo history.
 - Cached 8-cell structural regions and boundary bonds, graph-based connectivity, prepared fragment reuse, atomic collision-cache staging, and a frozen reference solver for differential validation.
+- First-person player sessions with grounded capsule movement, authored spawn/bounds recovery, transient player state, authoritative tool intents, four-player roster replication, and bounded local prediction/reconciliation. Dynamic debris is represented as an approximate kinematic obstacle on the predicting client, so corrections remain possible after a fracture.
+- `games/quarry-demolition`, a seeded quarry course with four south approach spawns, four supported works columns, an isolated amber core, and a material-count objective requiring 68% works removal while retaining 80% core integrity. Player state is transient and does not change version-3 saves or checksums.
 
 ## Still required for the full release
 
 - General iterative elastic beam solving and calibration beyond the current support-path load approximation; torsional/free-body contact equilibrium and fatigue-state persistence need further work.
 - Broader destruction workloads, rotating-fragment extraction, edit copies, and network/save performance. The finite quarry benchmark now has region-based structural preparation and five-run latency measurements; larger maps, streaming, and LOD remain deferred.
-- Physical player characters, replicated player poses, and complete client movement prediction/reconciliation. Current player cameras are free-flight inspection/gameplay cameras.
 - A separate Lua presentation VM, richer HUD/audio APIs, general component registration, and more complete prefab/project authoring.
 - Stronger stress/collision/connectivity overlays, configurable joints, bounds/debris policies, and editor polish.
-- Longer four-player motion/destruction soak tests and measured bandwidth/memory budgets. The current edit/late-join impairment test passes at 100 ms RTT, jitter/reordering, and 2% loss.
+- Extended four-player motion/destruction soak tests and measured bandwidth/memory budgets beyond the local ten-minute stability run. The current edit/late-join impairment test passes at 100 ms RTT, jitter/reordering, and 2% loss.
 - Measured performance on the designated M1/GTX 1660 hardware, native Windows/Linux runtime checks, and signed distributable releases.
 
 The lighting implementation is present, with local Metal validation and portable
@@ -41,3 +42,11 @@ See [rendering](RENDERING.md) for approximation limits and
 [validation](VALIDATION.md) for the measured evidence.
 
 These are unfinished engineering items, not silently claimed features. The foundation is intended to make subsequent milestones testable and reviewable.
+
+
+Optional full path tracing is implemented through separate native Metal and
+Vulkan backends. Metal runtime and lifecycle/capture checks pass on the M3;
+Vulkan builds/shaders validate locally, with Windows/Linux runtime checks pending.
+Native 1080p M3 sustained frame p95 is 37–89 ms across the four fixtures, so the
+30 FPS target is not qualified. See [path tracing](PATH_TRACING.md) and the
+[validation evidence](VALIDATION.md).

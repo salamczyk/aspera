@@ -150,3 +150,9 @@ Native Direct3D11/Vulkan checks, target GPU measurements, and an actual 2× pixe
 density display remain external validation requirements. CI contains three-OS
 shader builds and an opt-in graphics smoke job; defining a job is not evidence
 that it has passed. See [validation](VALIDATION.md) for actual results.
+
+## Optional path tracing
+
+The Renderer facade also selects native Metal or Vulkan full path tracing at
+startup. Its GPU resources and presentation are independent of bgfx. See
+[path tracing](PATH_TRACING.md) for transport, settings, and qualification.

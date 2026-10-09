@@ -1,0 +1,86 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+#include "pt_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(std140, set = 0, binding = 0) uniform PtParamsBlock { PtParams params; };
+layout(push_constant) uniform PtFilterPush { uint pass; } filterPush;
+
+layout(set = 0, binding = 13, rgba32f) uniform readonly image2D historyDiffuse;
+layout(set = 0, binding = 14, rgba32f) uniform readonly image2D historySpecular;
+layout(set = 0, binding = 15, rgba32f) uniform readonly image2D historyGuide;
+layout(set = 0, binding = 17, rgba32f) uniform readonly image2D moments;
+layout(set = 0, binding = 19, rgba32f) uniform image2D filterA;
+layout(set = 0, binding = 20, rgba32f) uniform image2D filterB;
+layout(set = 0, binding = 22, rgba32f) uniform writeonly image2D scratchA;
+
+ivec2 ptFilterSize() { return ivec2(params.sizeFrame.xy); }
+ivec2 ptFilterClamp(ivec2 p) { return clamp(p, ivec2(0), ptFilterSize() - ivec2(1)); }
+
+vec4 ptFilterLoad(ivec2 p, uint pass) {
+    p = ptFilterClamp(p);
+    if (pass == 0u) return imageLoad(historyDiffuse, p) + imageLoad(historySpecular, p);
+    if ((pass & 1u) != 0u) return imageLoad(filterA, p);
+    return imageLoad(filterB, p);
+}
+
+void ptFilterStore(ivec2 p, uint pass, vec4 value) {
+    if (pass == 0u || pass == 2u) imageStore(filterA, p, value);
+    else if (pass == 1u || pass == 3u) imageStore(filterB, p, value);
+    else imageStore(scratchA, p, value);
+}
+
+float ptFilterKernel(int i) {
+    return i == 0 ? 0.5 : 0.25;
+}
+
+// Guides already contain unit normals. Integer power avoids a general pow/log.
+float ptNormalWeight(vec3 a, vec3 b) {
+    float w = clamp(dot(a,b),0.0,1.0);
+    w *= w; w *= w; w *= w; w *= w; return w*w;
+}
+
+void main() {
+    uvec2 pixelU = gl_GlobalInvocationID.xy;
+    if (pixelU.x >= params.sizeFrame.x || pixelU.y >= params.sizeFrame.y) return;
+    ivec2 pixel = ivec2(pixelU);
+    ivec2 size = ptFilterSize();
+    vec4 center = ptFilterLoad(pixel, filterPush.pass);
+    vec4 centerGuide = imageLoad(historyGuide, pixel);
+    vec2 centerMoments = imageLoad(moments, pixel).rg;
+    float variance = max(centerMoments.y - centerMoments.x * centerMoments.x, 0.0);
+    if (params.options.x == 0u || filterPush.pass >= 5u) {
+        ptFilterStore(pixel, filterPush.pass, vec4(max(center.rgb, vec3(0.0)), 1.0));
+        return;
+    }
+    float sigma = sqrt(variance + 1.0e-5);
+    float centerLum = ptLuminance(center.rgb);
+    float minLum = max(0.0, centerMoments.x - 2.5 * sigma);
+    float maxLum = centerMoments.x + 2.5 * sigma;
+    if (centerLum > 1.0e-5) center.rgb *= clamp(centerLum, minLum, maxLum) / centerLum;
+    vec3 result = vec3(0.0);
+    float totalWeight = 0.0;
+    int stepSize = 1 << int(filterPush.pass);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 samplePixel = ptFilterClamp(pixel + ivec2(x, y) * stepSize);
+            vec4 sampleValue = ptFilterLoad(samplePixel, filterPush.pass);
+            vec4 sampleGuide = imageLoad(historyGuide, samplePixel);
+            float spatial = ptFilterKernel(x) * ptFilterKernel(y);
+            bool centerSurface = dot(centerGuide.xyz, centerGuide.xyz) > 0.01;
+            bool sampleSurface = dot(sampleGuide.xyz, sampleGuide.xyz) > 0.01;
+            float normalWeight = !centerSurface && !sampleSurface ? 1.0 :
+                                 centerSurface && sampleSurface ? ptNormalWeight(centerGuide.xyz, sampleGuide.xyz) : 0.0;
+            float depthScale = max(abs(centerGuide.w), 0.05);
+            float depthWeight = exp(-abs(centerGuide.w - sampleGuide.w) / depthScale * 4.0);
+            float sampleLum = ptLuminance(sampleValue.rgb);
+            float varianceWeight = exp(-abs(sampleLum - centerMoments.x) / (sigma + 0.01));
+            float weight = spatial * normalWeight * depthWeight * varianceWeight;
+            result += sampleValue.rgb * weight;
+            totalWeight += weight;
+        }
+    }
+    result = totalWeight > 1.0e-6 ? result / totalWeight : center.rgb;
+    ptFilterStore(pixel, filterPush.pass, vec4(max(result, vec3(0.0)), 1.0));
+}
